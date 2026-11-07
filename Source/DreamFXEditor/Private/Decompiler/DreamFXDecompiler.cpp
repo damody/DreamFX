@@ -2212,7 +2212,9 @@ namespace UE::DreamFX::Editor
 			while (CurrentParent.Emitter != nullptr)
 			{
 				const FVersionedNiagaraEmitterData* Data = CurrentParent.GetEmitterData();
-				if (Data == nullptr || CurrentParent.Emitter->FindVersionData(CurrentParent.Version) == nullptr
+				// EndlessAlice local hunk: a null version GUID is a legacy (pre-versioning) parent reference that Niagara
+				// resolves to the exposed version; only a non-null GUID can be unavailable.
+				if (Data == nullptr || (CurrentParent.Version.IsValid() && CurrentParent.Emitter->FindVersionData(CurrentParent.Version) == nullptr)
 					|| Visited.Contains(CurrentParent.Emitter))
 				{
 					NoteInheritanceLimit(Info.Name, TEXT("the parent chain has an unavailable version or a cycle; this source cannot rebuild until the parent is repaired"), Result, Diagnostics);

@@ -2275,7 +2275,9 @@ namespace UE::DreamFX::Editor
 					while (Current.Emitter)
 					{
 						const FVersionedNiagaraEmitterData* Data = Current.GetEmitterData();
-						if (!Data || !Current.Emitter->FindVersionData(Current.Version) || Visited.Contains(Current.Emitter))
+						// EndlessAlice local hunk: a null version GUID is a legacy (pre-versioning) parent reference that Niagara
+						// resolves to the exposed version; only a non-null GUID can be unavailable.
+						if (!Data || (Current.Version.IsValid() && !Current.Emitter->FindVersionData(Current.Version)) || Visited.Contains(Current.Emitter))
 						{
 							Diagnostics.Error(TEXT("DFX3056"), Source->NativeParentLocation,
 								FString::Printf(TEXT("Native parent has an unavailable version or a cyclic parent chain: %s."), *ParentPath));
