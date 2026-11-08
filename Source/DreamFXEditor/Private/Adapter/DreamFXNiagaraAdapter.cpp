@@ -3249,6 +3249,39 @@ namespace UE::DreamFX::Editor
 		// nothing is reported. Routing sends these through the pin path; if a caller gets here
 		// anyway, refuse with words instead of forwarding. A legal source file must never be able
 		// to kill the editor.
+		// EndlessAlice local hunk: not only a link. Any value written to a module's own static switch on the API rail
+		// reaches the same RemoveOverridePin -> CastChecked (24 content systems died on a literal into a scratch
+		// module's switch), so a switch is sent down the pin route here, whatever the caller thought it was.
+		// The test is the engine's own: a switch's override pin is an input pin on the function call node itself (the
+		// called graph's switch list can be another version's than the one the node pins).
+		if (Value.Mode != EInputValueMode::Linked && InputAddress.InputNameStack.Num() == 1)
+		{
+			if (UNiagaraNodeFunctionCall* GuardNode = FindModuleNode(InputAddress))
+			{
+				const FName GuardInputName = InputAddress.InputNameStack[0];
+				bool bPinOnCallNode = false;
+				for (const UEdGraphPin* Pin : GuardNode->Pins)
+				{
+					if (Pin != nullptr && Pin->Direction == EGPD_Input && Pin->PinName.IsEqual(GuardInputName))
+					{
+						bPinOnCallNode = true;
+						break;
+					}
+				}
+				if (bPinOnCallNode)
+				{
+					FStackAddress ModuleAddress = InputAddress;
+					ModuleAddress.InputNameStack.Reset();
+					bool bNotASwitch = false;
+					const bool bWritten = SetStaticSwitchByPin(ModuleAddress, GuardInputName, Value, bNotASwitch, OutErrors);
+					if (!bNotASwitch)
+					{
+						return bWritten;
+					}
+				}
+			}
+		}
+
 		if (Value.Mode == EInputValueMode::Linked && InputAddress.InputNameStack.Num() == 1)
 		{
 			if (UNiagaraNodeFunctionCall* GuardNode = FindModuleNode(InputAddress))
@@ -3316,6 +3349,11 @@ namespace UE::DreamFX::Editor
 		{
 			FEditContext ContextHolder(InputAddress.System);
 			FNiagaraExternalEditContext& Context = ContextHolder.Get();
+			// EndlessAlice local hunk: a write that kills the process in the engine leaves this line as the last one.
+			UE_LOG(LogDreamFX, Log, TEXT("SetInput %s/%s/%s/%s mode %d"), *InputAddress.EmitterName.ToString(),
+				*InputAddress.ScriptName.ToString(), *InputAddress.ModuleName.ToString(),
+				*FString::JoinBy(InputAddress.InputNameStack, TEXT("."), [](const FName& Name) { return Name.ToString(); }),
+				static_cast<int32>(Value.Mode));
 			UNiagaraExternalEditUtilities::SetStackInputData(ToReference(InputAddress), StackValue, Context);
 			bResult = Drain(Context, OutErrors);
 		}

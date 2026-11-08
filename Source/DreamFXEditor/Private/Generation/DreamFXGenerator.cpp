@@ -2577,6 +2577,31 @@ namespace UE::DreamFX::Editor
 			}
 		}
 
+		/**
+		 * EndlessAlice local hunk: the engine refuses a write to an input its switches hide or its edit condition grays
+		 * out. The original asset keeps such a stored override, and it does nothing there either -- the input is not in
+		 * the executing graph -- so after the retry it is reported as a warning and the build goes on.
+		 */
+		bool ReportInactiveInputRefusal(const TArray<FString>& Errors, const FSourceLocation& Location, FDiagnosticSink& Diagnostics)
+		{
+			if (Errors.IsEmpty())
+			{
+				return false;
+			}
+			for (const FString& Error : Errors)
+			{
+				if (!Error.Contains(TEXT("is hidden by static-switch")) && !Error.Contains(TEXT("EditCondition currently evaluates false")))
+				{
+					return false;
+				}
+			}
+			for (const FString& Error : Errors)
+			{
+				Diagnostics.Warning(TEXT("DFX5021"), Location, Error + TEXT(" The original keeps it inactive; it is left out."));
+			}
+			return true;
+		}
+
 		/** Removes every module from one script stack, so it can be rebuilt from the source order. */
 		bool ClearStack(const FStackAddress& OwnerAddress, FName ScriptName, FDiagnosticSink& Diagnostics,
 			const FSourceLocation& Location)
@@ -3060,7 +3085,8 @@ namespace UE::DreamFX::Editor
 					for (const FPlannedInput* Input : Refused)
 					{
 						Errors.Reset();
-						if (!ApplyPlannedInput(ModuleAddress.WithInputPath(Input->Path), *Input, Errors, OutDeferredSelfRefs))
+						if (!ApplyPlannedInput(ModuleAddress.WithInputPath(Input->Path), *Input, Errors, OutDeferredSelfRefs)
+							&& !ReportInactiveInputRefusal(Errors, Input->Location, Diagnostics))
 						{
 							ReportAdapterErrors(Errors, TEXT("DFX5021"), Input->Location, Diagnostics);
 							bOk = false;
@@ -3646,7 +3672,8 @@ namespace UE::DreamFX::Editor
 					for (const FPlannedInput* Input : Refused)
 					{
 						Errors.Reset();
-						if (!ApplyPlannedInput(ModuleAddress.WithInputPath(Input->Path), *Input, Errors, OutDeferredSelfRefs))
+						if (!ApplyPlannedInput(ModuleAddress.WithInputPath(Input->Path), *Input, Errors, OutDeferredSelfRefs)
+							&& !ReportInactiveInputRefusal(Errors, Input->Location, Diagnostics))
 						{
 							ReportAdapterErrors(Errors, TEXT("DFX5021"), Input->Location, Diagnostics);
 							bOk = false;

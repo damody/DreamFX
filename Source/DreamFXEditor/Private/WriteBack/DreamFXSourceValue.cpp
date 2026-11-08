@@ -30,6 +30,12 @@ namespace UE::DreamFX::Editor
 	FString ReferenceToPackagePath(const FString& ReferencePath)
 	{
 		FString PackagePath = ReferencePath;
+		// EndlessAlice local hunk: a native class (`/Script/Engine.PointLightComponent`, a component renderer's
+		// ComponentType) is named by the whole path; cutting at the dot left `/Script/Engine`, which names nothing.
+		if (PackagePath.StartsWith(TEXT("/Script/"), ESearchCase::CaseSensitive))
+		{
+			return PackagePath;
+		}
 		int32 Dot = INDEX_NONE;
 		if (PackagePath.FindLastChar(TEXT('.'), Dot))
 		{
@@ -70,7 +76,11 @@ namespace UE::DreamFX::Editor
 		FString ReferencePath;
 		if (Value.IsValid() && Value->Type == EJson::Object && Value->AsObject().IsValid()
 			&& Value->AsObject()->TryGetStringField(TEXT("refPath"), ReferencePath)
-			&& ReferencePath.StartsWith(TEXT("/")))
+			&& ReferencePath.StartsWith(TEXT("/"))
+			// EndlessAlice local hunk: a subobject of an asset (`Pkg.Asset:Emitter.Renderer_0`, a component renderer's
+			// TemplateComponent) is private to that asset; written as its package it named the asset itself, and the
+			// rebuild refused the property. It has no spelling, so the caller reports it as a gap instead.
+			&& !ReferencePath.Contains(TEXT(":")))
 		{
 			OutPackagePath = ReferenceToPackagePath(ReferencePath);
 			return true;
@@ -384,7 +394,15 @@ namespace UE::DreamFX::Editor
 			const FString Raw = Value->AsString();
 			// A path is quoted; an enumerator name or a bare word is not. Both spellings exist in the
 			// DSL, and which one a value needs is decided by the value itself.
-			OutSource = Raw.StartsWith(TEXT("/")) ? FString::Printf(TEXT("\"%s\""), *Raw) : Raw;
+			// EndlessAlice local hunk: a bare word is only safe when it lexes as one identifier. Anything else -- a
+			// format string such as `{frame_number}` (FlipbookSuffixFormat), a word with spaces, an empty string --
+			// is quoted too, or the file does not parse back (DFX2004).
+			bool bBareWord = !Raw.IsEmpty() && (FChar::IsAlpha(Raw[0]) || Raw[0] == TEXT('_'));
+			for (const TCHAR Character : Raw)
+			{
+				bBareWord &= FChar::IsAlnum(Character) || Character == TEXT('_');
+			}
+			OutSource = (Raw.StartsWith(TEXT("/")) || !bBareWord) ? QuoteSourceString(Raw) : Raw;
 			return true;
 		}
 

@@ -306,6 +306,13 @@ namespace UE::DreamFX::Editor
 
 	FString FValueLowering::DescribeDeclaredType(const FNiagaraTypeDefinition& Type)
 	{
+		// EndlessAlice local hunk: a static type is its own type definition, so `static bool` fell through every
+		// comparison below to the struct's name and came out `static NiagaraBool`, which the parser cannot read
+		// back (DFX2009). The caller writes `static`; the spelling is the runtime type's.
+		if (Type.IsStatic())
+		{
+			return DescribeDeclaredType(Type.RemoveStaticDef());
+		}
 		if (Type == FNiagaraTypeDefinition::GetFloatDef())    { return TEXT("float"); }
 		if (Type == FNiagaraTypeDefinition::GetIntDef())      { return TEXT("int"); }
 		if (Type == FNiagaraTypeDefinition::GetBoolDef())     { return TEXT("bool"); }
@@ -366,6 +373,9 @@ namespace UE::DreamFX::Editor
 			{ TEXT("LinearColor"), &FNiagaraTypeDefinition::GetColorDef },
 			{ TEXT("Position"),    &FNiagaraTypeDefinition::GetPositionDef },
 			{ TEXT("Quat"),        &FNiagaraTypeDefinition::GetQuatDef },
+			// EndlessAlice local hunk: a particle ID (Particles.ID, Particles.ParentID) is a parameter like any other;
+			// the decompiler writes its type by name, and without this entry such a file did not rebuild (DFX4021).
+			{ TEXT("NiagaraID"),   &FNiagaraTypeDefinition::GetIDDef },
 		};
 
 		for (const FScalarTypeEntry& Entry : ScalarTypes)
@@ -751,8 +761,18 @@ namespace UE::DreamFX::Editor
 			// A namespaced name is a parameter reference regardless of the target type; a bare name is
 			// an enum entry. Checking the namespace first matters because an enum-typed input can
 			// legitimately be driven by a linked parameter.
+			// EndlessAlice local hunk: an enum entry whose own name has a namespace's shape is that entry, not a link.
+			// ENiagaraParticleIDAttribute's entries read `Particles.IDIndex`; taken for a link, the value went to the
+			// static switch of ReturnParticleIDAttributes on the API rail, and the engine's CastChecked killed the
+			// process (32 content systems). Only an exact entry name wins; any other namespaced name is still a link.
 			if (IsNamespacedName(Value.Text))
 			{
+				FName EnumEntry;
+				if (UEnum* Enum = TargetType.GetEnum(); Enum != nullptr && FindEnumEntry(Enum, Value.Text, EnumEntry))
+				{
+					OutValue = FInputValue::MakeEnum(Enum, EnumEntry);
+					return true;
+				}
 				OutValue = FInputValue::MakeLinked(FNiagaraVariableBase(TargetType, FName(*Value.Text)));
 				return true;
 			}

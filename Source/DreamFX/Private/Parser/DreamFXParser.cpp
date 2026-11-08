@@ -198,13 +198,27 @@ namespace UE::DreamFX
 			while (Lexer.Peek().IsSymbol(TEXT(".")) || Lexer.Peek().IsSymbol(TEXT("/")))
 			{
 				const FString Separator = Lexer.Peek().Text;
-				if (Lexer.Peek(1).Kind != ETokenKind::Identifier)
+				// EndlessAlice local hunk: a folder of a path may start with a digit (`/Mob/Boss/001/Scripts/...`,
+				// `/001_Alice/`), which lexes as a number, or a number and the identifier glued to it. After a '/', take
+				// those too, joining the tokens that touch, so the path stays one name (DFX2009 otherwise).
+				const bool bPathSegmentNumber = Separator == TEXT("/") && Lexer.Peek(1).Kind == ETokenKind::Number;
+				if (Lexer.Peek(1).Kind != ETokenKind::Identifier && !bPathSegmentNumber)
 				{
 					break;
 				}
 				Lexer.Next();
 				Name += Separator;
-				Name += Lexer.Next().Text;
+				FToken Piece = Lexer.Next();
+				Name += Piece.Text;
+				if (Separator == TEXT("/"))
+				{
+					while ((Lexer.Peek().Kind == ETokenKind::Identifier || Lexer.Peek().Kind == ETokenKind::Number)
+						&& Lexer.Peek().Offset == Piece.Offset + Piece.Text.Len())
+					{
+						Piece = Lexer.Next();
+						Name += Piece.Text;
+					}
+				}
 			}
 
 			OutName = Name;
