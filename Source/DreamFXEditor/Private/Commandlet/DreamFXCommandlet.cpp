@@ -460,6 +460,32 @@ namespace
 	 * would have got file by file -- including the `Decompiled/` namespace, which is what makes
 	 * building the result harmless to the assets it was read from.
 	 */
+	/** EndlessAlice local hunk: drops every asset whose package is not listed in OnlyListPath (one /Game/... per line, tabs end a line). */
+	void KeepOnlyListed(const FString& OnlyListPath, TArray<FAssetData>& Assets)
+	{
+		if (OnlyListPath.IsEmpty())
+		{
+			return;
+		}
+		TArray<FString> OnlyLines;
+		FFileHelper::LoadFileToStringArray(OnlyLines, *OnlyListPath);
+		TSet<FString> Only;
+		for (FString Line : OnlyLines)
+		{
+			int32 Tab = INDEX_NONE;
+			if (Line.FindChar(TEXT('\t'), Tab))
+			{
+				Line.LeftInline(Tab);
+			}
+			Line.TrimStartAndEndInline();
+			if (!Line.IsEmpty())
+			{
+				Only.Add(Line);
+			}
+		}
+		Assets.RemoveAll([&Only](const FAssetData& Asset) { return !Only.Contains(Asset.PackageName.ToString()); });
+	}
+
 	int32 RunDecompileAll(const FString& SearchRoot, const FString& OnlyListPath = FString())
 	{
 		const TArray<FString> Roots = ParseContentRoots(SearchRoot);
@@ -469,21 +495,7 @@ namespace
 
 		// EndlessAlice local hunk: -Only=<file> keeps just the packages listed (one /Game/... per line), so a
 		// fix can be re-exported for the systems it touches without exporting whole folders again.
-		if (!OnlyListPath.IsEmpty())
-		{
-			TArray<FString> OnlyLines;
-			FFileHelper::LoadFileToStringArray(OnlyLines, *OnlyListPath);
-			TSet<FString> Only;
-			for (FString Line : OnlyLines)
-			{
-				Line.TrimStartAndEndInline();
-				if (!Line.IsEmpty())
-				{
-					Only.Add(Line);
-				}
-			}
-			Assets.RemoveAll([&Only](const FAssetData& Asset) { return !Only.Contains(Asset.PackageName.ToString()); });
-		}
+		KeepOnlyListed(OnlyListPath, Assets);
 
 		UE_LOG(LogDreamFX, Display, TEXT("=== DreamFX export over %d Niagara system(s) under %s ==="),
 			Assets.Num(), *FString::Join(Roots, TEXT(", ")));
@@ -571,12 +583,13 @@ namespace
 	 * -- so it is dropped from both. The `Name=` lines already agree: rehoming into `Decompiled/` is
 	 * idempotent, so the mirror re-exports under the mirror's own name.
 	 */
-	int32 RunMirrorDiff(const FString& SearchRoot, const bool bCheckCompile)
+	int32 RunMirrorDiff(const FString& SearchRoot, const bool bCheckCompile, const FString& OnlyListPath = FString())
 	{
 		const TArray<FString> Roots = ParseContentRoots(SearchRoot);
 
 		TArray<FAssetData> Assets;
 		FindSystems(Roots, /*bIncludeMirrors=*/false, Assets);
+		KeepOnlyListed(OnlyListPath, Assets);
 
 		UE_LOG(LogDreamFX, Display, TEXT("=== DreamFX mirror diff over %d Niagara system(s) under %s ==="),
 			Assets.Num(), *FString::Join(Roots, TEXT(", ")));
@@ -1313,7 +1326,9 @@ int32 UDreamFXCommandlet::Main(const FString& Params)
 	{
 		FString SearchRoot;
 		FParse::Value(*Params, TEXT("Path="), SearchRoot);
-		return RunMirrorDiff(SearchRoot, /*bCheckCompile=*/!FParse::Param(*Params, TEXT("NoCompile")));
+		FString OnlyListPath;
+		FParse::Value(*Params, TEXT("Only="), OnlyListPath);
+		return RunMirrorDiff(SearchRoot, /*bCheckCompile=*/!FParse::Param(*Params, TEXT("NoCompile")), OnlyListPath);
 	}
 
 	FString RenameSpec;

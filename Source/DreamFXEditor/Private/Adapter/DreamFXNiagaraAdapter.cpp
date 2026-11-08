@@ -730,6 +730,57 @@ namespace UE::DreamFX::Editor
 		}
 
 		/**
+		 * EndlessAlice local hunk: sets the top-level object and class references of a blob that the importer left unset.
+		 *
+		 * The importer drops a TSubclassOf naming a Blueprint class (`CameraShake` on a CameraShakeSourceComponent, written
+		 * as `/Game/X/BP.BP_C`) without reporting it, so the rebuilt component plays no shake. Each such field is loaded
+		 * here and checked against the property's class, like the editor's own picker would.
+		 */
+		bool ApplyUnsetObjectReferences(UObject* Target, const FString& PropertiesJson, TArray<FString>& OutErrors)
+		{
+			TSharedPtr<FJsonObject> Parsed;
+			const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(PropertiesJson);
+			if (Target == nullptr || !FJsonSerializer::Deserialize(Reader, Parsed) || !Parsed.IsValid())
+			{
+				return true;
+			}
+			bool bOk = true;
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : Parsed->Values)
+			{
+				FString Path;
+				if (!Field.Value.IsValid() || !Field.Value->TryGetString(Path) || Path.IsEmpty() || Path == TEXT("None"))
+				{
+					continue;
+				}
+				FObjectPropertyBase* Property = FindFProperty<FObjectPropertyBase>(Target->GetClass(), FName(*Field.Key));
+				if (Property == nullptr || Property->IsA<FSoftObjectProperty>()
+					|| Property->GetObjectPropertyValue_InContainer(Target) != nullptr)
+				{
+					continue;
+				}
+				UObject* Loaded = nullptr;
+				if (const FClassProperty* ClassProperty = CastField<FClassProperty>(Property))
+				{
+					UClass* Class = LoadObject<UClass>(nullptr, *Path);
+					Loaded = Class != nullptr && Class->IsChildOf(ClassProperty->MetaClass) ? Class : nullptr;
+				}
+				else
+				{
+					UObject* Object = LoadObject<UObject>(nullptr, *Path);
+					Loaded = Object != nullptr && Object->IsA(Property->PropertyClass) ? Object : nullptr;
+				}
+				if (Loaded == nullptr)
+				{
+					OutErrors.Add(FString::Printf(TEXT("Cannot set '%s' on '%s' to '%s'."), *Field.Key, *Target->GetClass()->GetName(), *Path));
+					bOk = false;
+					continue;
+				}
+				Property->SetObjectPropertyValue_InContainer(Target, Loaded);
+			}
+			return bOk;
+		}
+
+		/**
 		 * A compile-time constant as the string a pin default holds.
 		 *
 		 * Shared by both static write paths -- the switch pin on the function call node and the
@@ -1437,6 +1488,22 @@ namespace UE::DreamFX::Editor
 		// escape. Nothing in Niagara produces one, and inventing a rule for it now would be a rule
 		// nobody could check.
 		return FString::Printf(TEXT("`%s`"), *Name);
+	}
+
+	bool IsInvalidBoxJson(const FJsonObject& Box)
+	{
+		const TSharedPtr<FJsonValue> Field = Box.TryGetField(TEXT("IsValid"));
+		if (!Field.IsValid())
+		{
+			return false;
+		}
+		bool bValid = true;
+		double Number = 1.0;
+		if (Field->TryGetBool(bValid))
+		{
+			return !bValid;
+		}
+		return Field->TryGetNumber(Number) && Number == 0.0;
 	}
 
 	FString FormatFloatLossless(float Value)
@@ -3971,15 +4038,42 @@ namespace UE::DreamFX::Editor
 			}
 		}
 
+		// EndlessAlice local hunk: a mesh renderer with the mesh flipbook on rebuilds `Meshes` from FirstFlipbookFrame
+		// whenever a flipbook property changes (UNiagaraMeshRendererProperties::RebuildMeshList), dropping each entry's
+		// pivot, scale and rotation. The asset keeps the list as edited after that rebuild, so `Meshes` goes in last.
+		FString DeferredMeshesJson;
+		{
+			TSharedPtr<FJsonObject> Root;
+			const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(EffectiveJson);
+			bool bFlipbook = false;
+			if (FJsonSerializer::Deserialize(Reader, Root) && Root.IsValid() && Root->HasField(TEXT("Meshes"))
+				&& Root->TryGetBoolField(TEXT("bEnableMeshFlipbook"), bFlipbook) && bFlipbook)
+			{
+				const TSharedRef<FJsonObject> Deferred = MakeShared<FJsonObject>();
+				Deferred->SetField(TEXT("Meshes"), Root->TryGetField(TEXT("Meshes")));
+				Root->RemoveField(TEXT("Meshes"));
+				const TSharedRef<TJsonWriter<>> DeferredWriter = TJsonWriterFactory<>::Create(&DeferredMeshesJson);
+				FJsonSerializer::Serialize(Deferred, DeferredWriter);
+				EffectiveJson.Reset();
+				const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&EffectiveJson);
+				FJsonSerializer::Serialize(Root.ToSharedRef(), Writer);
+			}
+		}
+
 		// A renderer is addressed by index and its properties add no stack entries, so this is a value
 		// write: the epoch survives it.
 		++GStats.ValueCalls;
 		bool bOk = true;
+		for (const FString* Pass : { &EffectiveJson, &DeferredMeshesJson })
 		{
+			if (!bOk || Pass->IsEmpty())
+			{
+				continue;
+			}
 			FEditContext ContextHolder(RendererAddress.System);
 			FNiagaraExternalEditContext& Context = ContextHolder.Get();
 			FNiagaraExt_RendererData Data;
-			Data.PropertyValues = NormalizeObjectReferences(EffectiveJson);
+			Data.PropertyValues = NormalizeObjectReferences(*Pass);
 			UE_LOG(LogDreamFX, Verbose, TEXT("SetRendererData %s"), *Data.PropertyValues);
 			UNiagaraExternalEditUtilities::SetRendererData(ToReference(RendererAddress), Data, Context);
 			bOk = Drain(Context, OutErrors);
@@ -4026,6 +4120,11 @@ namespace UE::DreamFX::Editor
 						Subobject, NormalizeObjectReferences(StripReadOnlyProperties(Class, Write.PropertiesJson))))
 				{
 					OutErrors.Add(FString::Printf(TEXT("Failed to set the properties of '%s' (%s)."), *Write.Property, *Write.ClassPath));
+					bOk = false;
+					continue;
+				}
+				if (!ApplyUnsetObjectReferences(Subobject, NormalizeObjectReferences(Write.PropertiesJson), OutErrors))
+				{
 					bOk = false;
 					continue;
 				}

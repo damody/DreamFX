@@ -789,9 +789,10 @@ namespace UE::DreamFX::Editor
 					{
 						return FormatFloat(static_cast<float>(Corner->GetNumberField(Name)));
 					};
-					Text = FString::Printf(TEXT("box(%s, %s, %s, %s, %s, %s)"),
+					Text = FString::Printf(TEXT("box(%s, %s, %s, %s, %s, %s%s)"),
 						*Axis(*Min, TEXT("X")), *Axis(*Min, TEXT("Y")), *Axis(*Min, TEXT("Z")),
-						*Axis(*Max, TEXT("X")), *Axis(*Max, TEXT("Y")), *Axis(*Max, TEXT("Z")));
+						*Axis(*Max, TEXT("X")), *Axis(*Max, TEXT("Y")), *Axis(*Max, TEXT("Z")),
+						IsInvalidBoxJson(**Box) ? TEXT(", false") : TEXT(""));
 					break;
 				}
 				case EJson::Boolean:

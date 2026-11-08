@@ -4,6 +4,8 @@
 #include "DreamFXTypes.h"
 #include "NiagaraTypes.h"
 
+class FJsonObject;
+
 class UNiagaraDataInterface;
 class UNiagaraEmitter;
 class UNiagaraRendererProperties;
@@ -171,6 +173,9 @@ namespace UE::DreamFX::Editor
 	 * exactly, and the reader cannot include the generation layer without a cycle.
 	 */
 	FString FormatFloatLossless(float Value);
+
+	/** EndlessAlice local hunk: an FBox's JSON whose IsValid is present and false (written as `box(..., false)`). */
+	bool IsInvalidBoxJson(const FJsonObject& Box);
 
 	struct FModuleSchema
 	{

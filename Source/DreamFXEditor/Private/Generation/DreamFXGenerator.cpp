@@ -696,9 +696,10 @@ namespace UE::DreamFX::Editor
 					return FormatFloatLossless(static_cast<float>(Corner->GetNumberField(Name)));
 				};
 
-				OutSource = FString::Printf(TEXT("box(%s, %s, %s, %s, %s, %s)"),
+				OutSource = FString::Printf(TEXT("box(%s, %s, %s, %s, %s, %s%s)"),
 					*Axis(*Min, TEXT("X")), *Axis(*Min, TEXT("Y")), *Axis(*Min, TEXT("Z")),
-					*Axis(*Max, TEXT("X")), *Axis(*Max, TEXT("Y")), *Axis(*Max, TEXT("Z")));
+					*Axis(*Max, TEXT("X")), *Axis(*Max, TEXT("Y")), *Axis(*Max, TEXT("Z")),
+					IsInvalidBoxJson(**Box) ? TEXT(", false") : TEXT(""));
 				return true;
 			}
 
@@ -741,10 +742,17 @@ namespace UE::DreamFX::Editor
 		bool BoxCallToJson(const FValue& Value, const FString& PropertyName, FDiagnosticSink& Diagnostics,
 			TSharedPtr<FJsonValue>& OutJson)
 		{
-			if (Value.Elements.Num() != 6)
+			// EndlessAlice local hunk: an optional seventh `false` keeps the box invalid. Assets hold such boxes (a
+			// fixed-bounds emitter whose box was never set), and the engine ignores an invalid box when it adds bounds up.
+			bool bValid = true;
+			if (Value.Elements.Num() == 7 && Value.Elements[6].IsValid() && Value.Elements[6]->Kind == EValueKind::Bool)
+			{
+				bValid = Value.Elements[6]->bBool;
+			}
+			else if (Value.Elements.Num() != 6)
 			{
 				Diagnostics.Error(TEXT("DFX4023"), Value.Location,
-					FString::Printf(TEXT("Property '%s': box() takes 6 numbers -- minX, minY, minZ, maxX, maxY, maxZ."),
+					FString::Printf(TEXT("Property '%s': box() takes 6 numbers -- minX, minY, minZ, maxX, maxY, maxZ -- and an optional false for an invalid box."),
 						*PropertyName));
 				return false;
 			}
@@ -776,7 +784,7 @@ namespace UE::DreamFX::Editor
 			Box->SetObjectField(TEXT("Max"), MakePoint(Components[3], Components[4], Components[5]));
 			// FBox is ignored entirely unless IsValid is set; a box that reads as invalid silently does
 			// nothing, which is the worst possible failure mode for a bounds setting.
-			Box->SetNumberField(TEXT("IsValid"), 1);
+			Box->SetNumberField(TEXT("IsValid"), bValid ? 1 : 0);
 			OutJson = MakeShared<FJsonValueObject>(Box);
 			return true;
 		}
@@ -940,6 +948,29 @@ namespace UE::DreamFX::Editor
 				if (!DeclaredProperties.Contains(Companion))
 				{
 					Properties->SetBoolField(Companion, true);
+				}
+			}
+
+			// EndlessAlice local hunk: the engine resolves WarmupTime as FloorToInt(WarmupTime / WarmupTickDelta) ticks, and a
+			// source written with six decimals (`4.933333` for 74 ticks of 1/15) lands a hair low and loses a tick. A value
+			// within a thousandth of a tick of a whole count is moved to the middle of that tick; the engine then stores
+			// count * delta itself.
+			double WarmupTime = 0.0;
+			if (Properties->TryGetNumberField(TEXT("WarmupTime"), WarmupTime) && WarmupTime > 0.0)
+			{
+				double TickDelta = 1.0 / 15.0;
+				if (Defaults.IsValid())
+				{
+					Defaults->TryGetNumberField(TEXT("WarmupTickDelta"), TickDelta);
+				}
+				if (TickDelta > UE_KINDA_SMALL_NUMBER)
+				{
+					const double Ticks = WarmupTime / TickDelta;
+					const double Whole = FMath::RoundToDouble(Ticks);
+					if (FMath::Abs(Ticks - Whole) < 1e-3)
+					{
+						Properties->SetNumberField(TEXT("WarmupTime"), (Whole + 0.5) * TickDelta);
+					}
 				}
 			}
 
