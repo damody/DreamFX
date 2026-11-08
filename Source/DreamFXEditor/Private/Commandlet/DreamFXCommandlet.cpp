@@ -26,6 +26,9 @@
 #include "Serialization/JsonWriter.h"
 #include "NiagaraDataInterface.h"
 #include "NiagaraEmitter.h"
+#include "UObject/Package.h"
+#include "Editor.h"
+#include "UObject/UObjectHash.h"
 #include "NiagaraEmitterHandle.h"
 #include "NiagaraRendererProperties.h"
 #include "NiagaraScript.h"
@@ -309,6 +312,70 @@ namespace
 	 * Plan Phase 5 asks for this so v2's feature order is decided by what the project actually
 	 * contains, rather than by which gap is most annoying to think about.
 	 */
+
+	/**
+	 * EndlessAlice local hunk: memory for the loops that visit every system under a path in one process.
+	 *
+	 * A loaded system is RF_Standalone, which GARBAGE_COLLECTION_KEEPFLAGS keeps in the editor, so the loops
+	 * below held every system (and every mirror) they had visited until the process hit the UObject limit
+	 * (`Maximum number of UObjects exceeded` after ~730 systems of a /Game mirror-diff). Each visited package
+	 * gives up the flag once the loop is done with it -- only those packages: module scripts and parent emitters
+	 * stay -- and every 25 assets the adapter's shared contexts for them are dropped and the garbage collected.
+	 */
+	class FBatchReclaim
+	{
+	public:
+		void Add(const UObject* Asset)
+		{
+			if (Asset != nullptr && Asset->GetOutermost() != nullptr)
+			{
+				Pending.AddUnique(Asset->GetOutermost()->GetFName());
+			}
+		}
+
+		void Tick()
+		{
+			if (++Count % 25 == 0)
+			{
+				Flush();
+			}
+		}
+
+		void Flush()
+		{
+			for (const FName& PackageName : Pending)
+			{
+				if (UPackage* Package = FindPackage(nullptr, *PackageName.ToString()))
+				{
+					ForEachObjectWithPackage(Package, [](UObject* Object)
+					{
+						if (UNiagaraSystem* System = Cast<UNiagaraSystem>(Object))
+						{
+							UE::DreamFX::Editor::FNiagaraAdapter::EndStructuralEpoch(System);
+						}
+						Object->ClearFlags(RF_Standalone);
+						return true;
+					}, /*bIncludeNestedObjects=*/true);
+				}
+			}
+			Pending.Reset();
+			// The undo buffer holds every object a build Modify()-ed; nothing undoes in a commandlet.
+			if (GEditor != nullptr)
+			{
+				GEditor->ResetTransaction(NSLOCTEXT("DreamFX", "BatchReclaim", "DreamFX batch reclaim"));
+			}
+			const int32 LiveBefore = GUObjectArray.GetObjectArrayNumMinusAvailable();
+			CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS, /*bPerformFullPurge=*/true);
+			UE_LOG(LogDreamFX, Display, TEXT("Batch reclaim after %d asset(s): %d -> %d live objects, %llu MB used."),
+				Count, LiveBefore, GUObjectArray.GetObjectArrayNumMinusAvailable(),
+				FPlatformMemory::GetStats().UsedPhysical / (1024 * 1024));
+		}
+
+	private:
+		TArray<FName> Pending;
+		int32 Count = 0;
+	};
+
 	int32 RunCoverage(const FString& SearchRoot)
 	{
 		const TArray<FString> Roots = ParseContentRoots(SearchRoot);
@@ -326,9 +393,12 @@ namespace
 		TMap<FString, int32> FeatureCounts;
 		TMap<FString, TArray<FString>> FeatureOwners;
 
+		FBatchReclaim Reclaim;
 		for (const FAssetData& Asset : Assets)
 		{
+			Reclaim.Tick();
 			UNiagaraSystem* System = Cast<UNiagaraSystem>(Asset.GetAsset());
+			Reclaim.Add(System);
 			if (System == nullptr)
 			{
 				++Failed;
@@ -412,11 +482,14 @@ namespace
 		int32 Written = 0;
 		int32 Failed = 0;
 
+		FBatchReclaim Reclaim;
 		for (const FAssetData& Asset : Assets)
 		{
+			Reclaim.Tick();
 			const FString PackagePath = Asset.PackageName.ToString();
 
 			UNiagaraSystem* System = Cast<UNiagaraSystem>(Asset.GetAsset());
+			Reclaim.Add(System);
 			if (System == nullptr)
 			{
 				++Failed;
@@ -554,8 +627,10 @@ namespace
 		int32 CompilePassed = 0;
 		int32 CompileFailed = 0;
 
+		FBatchReclaim Reclaim;
 		for (const FAssetData& Asset : Assets)
 		{
+			Reclaim.Tick();
 			const FString PackagePath = Asset.PackageName.ToString();
 
 			FString RootToken;
@@ -572,8 +647,10 @@ namespace
 				PackagePath.RightChop(MountPoint.Len() + 1));
 
 			UNiagaraSystem* Original = Cast<UNiagaraSystem>(Asset.GetAsset());
+			Reclaim.Add(Original);
 			UNiagaraSystem* Mirror = LoadObject<UNiagaraSystem>(nullptr,
 				*FDreamFXPaths::ToObjectPath(MirrorPath));
+			Reclaim.Add(Mirror);
 
 			if (Mirror == nullptr)
 			{
@@ -791,8 +868,10 @@ namespace
 		int32 Missing = 0;
 		int32 Failed = 0;
 
+		FBatchReclaim Reclaim;
 		for (const FAssetData& Asset : Assets)
 		{
+			Reclaim.Tick();
 			const FString PackagePath = Asset.PackageName.ToString();
 
 			FString RootToken;
@@ -808,8 +887,10 @@ namespace
 				PackagePath.RightChop(MountPoint.Len() + 1));
 
 			UNiagaraSystem* Original = Cast<UNiagaraSystem>(Asset.GetAsset());
+			Reclaim.Add(Original);
 			UNiagaraSystem* Mirror = LoadObject<UNiagaraSystem>(nullptr,
 				*FDreamFXPaths::ToObjectPath(MirrorPath));
+			Reclaim.Add(Mirror);
 			if (Mirror == nullptr)
 			{
 				++Missing;
@@ -1391,6 +1472,12 @@ int32 UDreamFXCommandlet::Main(const FString& Params)
 		// this -- and regressed nondeterministically with the gate armed anywhere deeper.
 		UE::DreamFX::Editor::FNiagaraAdapter::CollectIfHeavy(/*bIncludeObjectCountGate=*/true);
 
+		// EndlessAlice local hunk: mirrors built by earlier files (or earlier Main calls of a batch driver, hence the
+		// static) are released; CollectIfHeavy keeps them, being RF_Standalone. In-flight pipelined builds are never
+		// in the list, so nothing being built is touched.
+		static FBatchReclaim BuildReclaim;
+		BuildReclaim.Tick();
+
 		// .dfs and .dfm produce assets. A .dfe does not -- it is merged into its host by copy (R3), so
 		// it is parsed and linted only, which still fails the gate on a broken one rather than waiting
 		// until something references it.
@@ -1443,6 +1530,7 @@ int32 UDreamFXCommandlet::Main(const FString& Params)
 			continue;
 		}
 
+		BuildReclaim.Add(Result.System);
 		if (Result.bSkipped)
 		{
 			++Skipped;
