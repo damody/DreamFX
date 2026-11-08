@@ -720,6 +720,12 @@ namespace UE::DreamFX::Editor
 			// _LevelUpSpawn systems lost the texture behind their "LEVEL UP" text.
 			if (BaseType.IsUObject() && BaseType.GetClass() != nullptr)
 			{
+				// EndlessAlice local hunk: `""` is an empty slot set on purpose (a Set Variables entry with no asset).
+				if (Value.Text.IsEmpty())
+				{
+					OutValue = FInputValue::MakeObjectAsset(nullptr);
+					return true;
+				}
 				UObject* Asset = LoadObject<UObject>(nullptr, *Value.Text);
 				if (Asset == nullptr)
 				{

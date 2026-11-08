@@ -23,6 +23,7 @@
 #include "NiagaraEmitterHandle.h"
 #include "NiagaraEmitterFactoryNew.h"
 #include "NiagaraExternalSystemEditorUtilities.h"
+#include "Components/SceneComponent.h"
 #include "NiagaraGraph.h"
 #include "NiagaraNodeFunctionCall.h"
 #include "NiagaraNodeInput.h"
@@ -2102,7 +2103,25 @@ namespace UE::DreamFX::Editor
 			return true;
 		}
 
-		UNiagaraScriptVariable* ScriptVariable = Graph->GetScriptVariable(Default.Variable.GetName());
+		// EndlessAlice local hunk: a parameter linked as both Position and Vector3f has one script variable per
+		// type; by name alone the second write found the first again and left the other at Fail.
+		UNiagaraScriptVariable* ScriptVariable = nullptr;
+		for (const auto& Entry : Graph->GetAllMetaData())
+		{
+			if (Entry.Value != nullptr && Entry.Key.GetName() == Default.Variable.GetName()
+				&& Entry.Key.GetType() == Default.Variable.GetType())
+			{
+				ScriptVariable = Entry.Value;
+				break;
+			}
+		}
+		if (ScriptVariable == nullptr)
+		{
+			ScriptVariable = Graph->GetScriptVariable(Default.Variable.GetName());
+		}
+		UE_LOG(LogDreamFX, Verbose, TEXT("SetParameterDefault %s (%s) mode %d: %s"), *Default.Variable.GetName().ToString(),
+			*Default.Variable.GetType().GetName(), static_cast<int32>(Default.Mode),
+			ScriptVariable ? *FString::Printf(TEXT("found, was mode %d"), static_cast<int32>(ScriptVariable->DefaultMode)) : TEXT("not in graph"));
 		if (ScriptVariable == nullptr)
 		{
 			// Nothing created the parameter, so nothing reads it either. Still not an error: a source
@@ -3083,7 +3102,10 @@ namespace UE::DreamFX::Editor
 			// call -- FNiagaraExt_SetParameterEntry only carries a plain variable value. The module is
 			// created with a placeholder and the real value is written afterwards through SetInput,
 			// which addresses the entry as an input on the Set Parameters module.
-			if (Value.Mode == EInputValueMode::Literal || Value.Mode == EInputValueMode::Enum)
+			// EndlessAlice local hunk: an object entry (`Object<Texture> System.NS_Tex = ...`) too -- the stack input
+			// API has no object-asset payload, while the entry's variant carries the reference.
+			if (Value.Mode == EInputValueMode::Literal || Value.Mode == EInputValueMode::Enum
+				|| Value.Mode == EInputValueMode::ObjectAsset)
 			{
 				if (!ToVariableValue(Value, Entry.Get<1>(), Parameter.DefaultValue, OutErrors))
 				{
@@ -3843,6 +3865,61 @@ namespace UE::DreamFX::Editor
 			}
 		}
 
+		// EndlessAlice local hunk: an instanced subobject the decompiler wrote as its class and changed properties
+		// (`{"__dreamfxSubobject": "/Script/Engine.ChildActorComponent", "Properties": {...}}`, a component renderer's
+		// TemplateComponent). It is not a value the importer can set; it is made after the ordinary properties.
+		struct FSubobjectWrite
+		{
+			FString Property;
+			FString ClassPath;
+			FString PropertiesJson;
+		};
+		TArray<FSubobjectWrite> SubobjectWrites;
+		{
+			TSharedPtr<FJsonObject> Root;
+			const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(EffectiveJson);
+			if (FJsonSerializer::Deserialize(Reader, Root) && Root.IsValid())
+			{
+				TArray<FString> Keys;
+				for (const auto& Pair : Root->Values) { Keys.Add(FString(Pair.Key)); }
+				for (const FString& Key : Keys)
+				{
+					const TSharedPtr<FJsonObject>* Field = nullptr;
+					TSharedPtr<FJsonObject> Parsed;
+					FString Text;
+					if (!Root->TryGetObjectField(Key, Field) && Root->TryGetStringField(Key, Text) && Text.Contains(TEXT("__dreamfxSubobject")))
+					{
+						// Written in the source as a string, so it reaches here as one.
+						const TSharedRef<TJsonReader<>> FieldReader = TJsonReaderFactory<>::Create(Text);
+						if (FJsonSerializer::Deserialize(FieldReader, Parsed) && Parsed.IsValid())
+						{
+							Field = &Parsed;
+						}
+					}
+					FString ClassPath;
+					if (Field != nullptr && Field->IsValid() && (*Field)->TryGetStringField(TEXT("__dreamfxSubobject"), ClassPath))
+					{
+						FSubobjectWrite& Write = SubobjectWrites.AddDefaulted_GetRef();
+						Write.Property = Key;
+						Write.ClassPath = ClassPath;
+						const TSharedPtr<FJsonObject>* Properties = nullptr;
+						if ((*Field)->TryGetObjectField(TEXT("Properties"), Properties) && Properties != nullptr)
+						{
+							const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Write.PropertiesJson);
+							FJsonSerializer::Serialize(Properties->ToSharedRef(), Writer);
+						}
+						Root->RemoveField(Key);
+					}
+				}
+				if (SubobjectWrites.Num() > 0)
+				{
+					EffectiveJson.Reset();
+					const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&EffectiveJson);
+					FJsonSerializer::Serialize(Root.ToSharedRef(), Writer);
+				}
+			}
+		}
+
 		// A renderer is addressed by index and its properties add no stack entries, so this is a value
 		// write: the epoch survives it.
 		++GStats.ValueCalls;
@@ -3852,8 +3929,58 @@ namespace UE::DreamFX::Editor
 			FNiagaraExternalEditContext& Context = ContextHolder.Get();
 			FNiagaraExt_RendererData Data;
 			Data.PropertyValues = NormalizeObjectReferences(EffectiveJson);
+			UE_LOG(LogDreamFX, Verbose, TEXT("SetRendererData %s"), *Data.PropertyValues);
 			UNiagaraExternalEditUtilities::SetRendererData(ToReference(RendererAddress), Data, Context);
 			bOk = Drain(Context, OutErrors);
+		}
+		if (bOk && SubobjectWrites.Num() > 0)
+		{
+			UNiagaraRendererProperties* Renderer = nullptr;
+			if (RendererAddress.System != nullptr)
+			{
+				for (FNiagaraEmitterHandle& Candidate : RendererAddress.System->GetEmitterHandles())
+				{
+					if (Candidate.GetName() == RendererAddress.EmitterName)
+					{
+						if (FVersionedNiagaraEmitterData* EmitterData = Candidate.GetEmitterData())
+						{
+							const TArray<UNiagaraRendererProperties*>& Renderers = EmitterData->GetRenderers();
+							Renderer = Renderers.IsValidIndex(RendererAddress.RendererIndex) ? Renderers[RendererAddress.RendererIndex] : nullptr;
+						}
+						break;
+					}
+				}
+			}
+			for (const FSubobjectWrite& Write : SubobjectWrites)
+			{
+				FObjectPropertyBase* Property = Renderer ? FindFProperty<FObjectPropertyBase>(Renderer->GetClass(), FName(*Write.Property)) : nullptr;
+				UClass* Class = LoadObject<UClass>(nullptr, *Write.ClassPath);
+				if (Property == nullptr || Class == nullptr || !Class->IsChildOf(Property->PropertyClass))
+				{
+					OutErrors.Add(FString::Printf(TEXT("Cannot make '%s' as a '%s' on this renderer."), *Write.Property, *Write.ClassPath));
+					bOk = false;
+					continue;
+				}
+				Renderer->Modify();
+				// The flags and settings UNiagaraComponentRendererProperties::CreateTemplateComponent gives its own.
+				UObject* Subobject = NewObject<UObject>(Renderer, Class, NAME_None, RF_ArchetypeObject);
+				if (USceneComponent* Component = Cast<USceneComponent>(Subobject))
+				{
+					Component->SetVisibility(false);
+					Component->SetAutoActivate(false);
+					Component->SetComponentTickEnabled(false);
+				}
+				if (!Write.PropertiesJson.IsEmpty() && Write.PropertiesJson != TEXT("{}")
+					&& !UNiagaraExternalEditUtilities::GetPropertyProvider().SetObjectProperties(
+						Subobject, NormalizeObjectReferences(StripReadOnlyProperties(Class, Write.PropertiesJson))))
+				{
+					OutErrors.Add(FString::Printf(TEXT("Failed to set the properties of '%s' (%s)."), *Write.Property, *Write.ClassPath));
+					bOk = false;
+					continue;
+				}
+				Property->SetObjectPropertyValue_InContainer(Renderer, Subobject);
+				Renderer->PostEditChange();
+			}
 		}
 		if (bOk && bHasMeshBindings)
 		{
@@ -4580,7 +4707,10 @@ namespace UE::DreamFX::Editor
 				&& (!RequiresCpuByteCode.Contains(Script) || Script->GetVMExecutableData().HasByteCode());
 			if (!bHasExecutable || !Script->AreScriptAndSourceSynchronized())
 			{
-				OutStaleScripts.Add(FString::Printf(TEXT("%s/%s"), *Entry.Get<0>(), *Script->GetName()));
+				// EndlessAlice local hunk: say which of the two it is.
+				OutStaleScripts.Add(FString::Printf(TEXT("%s/%s%s"), *Entry.Get<0>(), *Script->GetName(),
+					!Script->GetVMExecutableDataCompilationId().IsValid() ? TEXT(" (no VM)")
+					: !bHasExecutable ? TEXT(" (no byte code)") : TEXT(" (out of sync)")));
 			}
 		}
 		return OutStaleScripts.Num() == 0;
@@ -6229,7 +6359,19 @@ namespace UE::DreamFX::Editor
 		// and FinalizeBuild performs one more compile in that case. A stale VM at this point is not
 		// that convergence case: no successful result was installed for the graph we just waited on.
 		TArray<FString> StaleScripts;
-		const bool bExecutableCurrent = VerifyCompiledStateCurrent(System, StaleScripts);
+		bool bExecutableCurrent = VerifyCompiledStateCurrent(System, StaleScripts);
+		// EndlessAlice local hunk: an emitter whose renderer binds Position to a custom attribute can install a
+		// VM for the graph as it was before the compile's own parameter sync touched it. Compile again against
+		// the synced graph, a bounded number of times, before calling it stale.
+		for (int32 Round = 0; Round < 3 && !bExecutableCurrent && !System->HasActiveCompilations(); ++Round)
+		{
+			UE_LOG(LogDreamFX, Log, TEXT("'%s': %s stale after compile; compiling again (round %d)."),
+				*System->GetName(), *FString::Join(StaleScripts, TEXT(", ")), Round + 1);
+			RequestCompileAsync(System, /*bForce=*/true);
+			System->WaitForCompilationComplete(bIncludingGpuShaders, /*bShowProgress=*/false);
+			StaleScripts.Reset();
+			bExecutableCurrent = VerifyCompiledStateCurrent(System, StaleScripts);
+		}
 
 		FNiagaraExternalEditContext Context(System);
 		FNiagaraExt_SystemCompileState State;

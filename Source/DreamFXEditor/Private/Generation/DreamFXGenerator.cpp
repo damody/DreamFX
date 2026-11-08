@@ -331,6 +331,13 @@ namespace UE::DreamFX::Editor
 				// because resolution only rewrites references that carry a root or look like a path.
 				FString Resolved;
 				FString Error;
+				// EndlessAlice local hunk: a class path (`ComponentType = "/Script/Engine.ChildActorComponent"`) is
+				// already Package.Object; appending the short name again made it unloadable (DFX5023).
+				if (Value.Text.StartsWith(TEXT("/Script/")))
+				{
+					OutJson = MakeShared<FJsonValueString>(Value.Text);
+					return true;
+				}
 				if (Value.Text.Contains(TEXT(":")) || Value.Text.StartsWith(TEXT("/")))
 				{
 					if (!FDreamFXPaths::ResolveAssetPath(Value.Text, DefaultRoot, Resolved, Error))
@@ -343,6 +350,14 @@ namespace UE::DreamFX::Editor
 					// converter demands the Package.Object form. ResolveAssetPath already assumes the
 					// asset shares the package's short name when it strips a suffix, so appending it
 					// back is lossless.
+					// EndlessAlice local hunk: a path that already names its object (`BP_X.BP_X_C`) is kept as written.
+					int32 LastSlash = INDEX_NONE;
+					Resolved.FindLastChar(TEXT('/'), LastSlash);
+					if (Resolved.Find(TEXT("."), ESearchCase::CaseSensitive, ESearchDir::FromStart, LastSlash + 1) != INDEX_NONE)
+					{
+						OutJson = MakeShared<FJsonValueString>(Resolved);
+						return true;
+					}
 					OutJson = MakeShared<FJsonValueString>(
 						FString::Printf(TEXT("%s.%s"), *Resolved, *FPackageName::GetShortName(Resolved)));
 					return true;
@@ -1085,6 +1100,18 @@ namespace UE::DreamFX::Editor
 			if (Candidates.Num() <= 1 || !Argument.Value.IsValid())
 			{
 				return Candidates.Num() > 0 ? Candidates[0] : nullptr;
+			}
+
+			// EndlessAlice local hunk: a name written exactly (`` `Scale RGB` ``) means that input, whatever else
+			// shares its identifier.
+			for (const FInputSchema* Candidate : Candidates)
+			{
+				FString Name = Candidate->Name.ToString();
+				Name.RemoveFromStart(TEXT("Module."), ESearchCase::IgnoreCase);
+				if (Name.Contains(TEXT(" ")) && Name == Argument.Name)
+				{
+					return Candidate;
+				}
 			}
 
 			for (const FInputSchema* Candidate : Candidates)
@@ -2602,6 +2629,27 @@ namespace UE::DreamFX::Editor
 			return true;
 		}
 
+		/** EndlessAlice local hunk: true when Path lies under an input already left out as inactive. */
+		bool IsUnderSkippedInput(const TArray<FName>& Path, const TArray<TArray<FName>>& Skipped)
+		{
+			for (const TArray<FName>& Prefix : Skipped)
+			{
+				if (Prefix.Num() < Path.Num())
+				{
+					bool bMatch = true;
+					for (int32 Index = 0; Index < Prefix.Num() && bMatch; ++Index)
+					{
+						bMatch = Prefix[Index] == Path[Index];
+					}
+					if (bMatch)
+					{
+						return true;
+					}
+				}
+			}
+			return false;
+		}
+
 		/** Removes every module from one script stack, so it can be rebuilt from the source order. */
 		bool ClearStack(const FStackAddress& OwnerAddress, FName ScriptName, FDiagnosticSink& Diagnostics,
 			const FSourceLocation& Location)
@@ -3082,14 +3130,25 @@ namespace UE::DreamFX::Editor
 					// The same second chance ApplyStack gives a refused write: whatever gated it -- an
 					// inline edit condition no schema flags -- has been written by now.
 					FNiagaraAdapter::EndStructuralEpoch(OwnerAddress.System);
+					TArray<TArray<FName>> SkippedInactive;
 					for (const FPlannedInput* Input : Refused)
 					{
-						Errors.Reset();
-						if (!ApplyPlannedInput(ModuleAddress.WithInputPath(Input->Path), *Input, Errors, OutDeferredSelfRefs)
-							&& !ReportInactiveInputRefusal(Errors, Input->Location, Diagnostics))
+						if (IsUnderSkippedInput(Input->Path, SkippedInactive))
 						{
-							ReportAdapterErrors(Errors, TEXT("DFX5021"), Input->Location, Diagnostics);
-							bOk = false;
+							continue;
+						}
+						Errors.Reset();
+						if (!ApplyPlannedInput(ModuleAddress.WithInputPath(Input->Path), *Input, Errors, OutDeferredSelfRefs))
+						{
+							if (ReportInactiveInputRefusal(Errors, Input->Location, Diagnostics))
+							{
+								SkippedInactive.Add(Input->Path);
+							}
+							else
+							{
+								ReportAdapterErrors(Errors, TEXT("DFX5021"), Input->Location, Diagnostics);
+								bOk = false;
+							}
 						}
 						else if (Report != nullptr)
 						{
@@ -3598,7 +3657,8 @@ namespace UE::DreamFX::Editor
 					// to be written afterwards, addressing the entry as an input on the new module.
 					for (const FPlannedSetParameter& Parameter : Module.Parameters)
 					{
-						if (Parameter.Value.Mode != EInputValueMode::Literal && Parameter.Value.Mode != EInputValueMode::Enum)
+						if (Parameter.Value.Mode != EInputValueMode::Literal && Parameter.Value.Mode != EInputValueMode::Enum
+							&& Parameter.Value.Mode != EInputValueMode::ObjectAsset)
 						{
 							FPlannedInput AsInput;
 							AsInput.Value = Parameter.Value;
@@ -3614,13 +3674,40 @@ namespace UE::DreamFX::Editor
 							}
 						}
 
+						// EndlessAlice local hunk: the same refuse-then-retry the module inputs get -- a toggle inside
+						// the chain gates its neighbours -- and an input still refused as inactive takes its chain with it.
+						TArray<const FPlannedInput*> RefusedNested;
 						for (const FPlannedInput& Nested : Parameter.NestedInputs)
 						{
 							Errors.Reset();
 							if (!ApplyPlannedInput(ModuleAddress.WithInputPath(Nested.Path), Nested, Errors, OutDeferredSelfRefs))
 							{
-								ReportAdapterErrors(Errors, TEXT("DFX5025"), Nested.Location, Diagnostics);
-								bOk = false;
+								RefusedNested.Add(&Nested);
+							}
+						}
+						if (RefusedNested.Num() > 0)
+						{
+							FNiagaraAdapter::EndStructuralEpoch(StackAddress.System);
+							TArray<TArray<FName>> SkippedInactive;
+							for (const FPlannedInput* Nested : RefusedNested)
+							{
+								if (IsUnderSkippedInput(Nested->Path, SkippedInactive))
+								{
+									continue;
+								}
+								Errors.Reset();
+								if (!ApplyPlannedInput(ModuleAddress.WithInputPath(Nested->Path), *Nested, Errors, OutDeferredSelfRefs))
+								{
+									if (ReportInactiveInputRefusal(Errors, Nested->Location, Diagnostics))
+									{
+										SkippedInactive.Add(Nested->Path);
+									}
+									else
+									{
+										ReportAdapterErrors(Errors, TEXT("DFX5025"), Nested->Location, Diagnostics);
+										bOk = false;
+									}
+								}
 							}
 						}
 					}
@@ -3669,14 +3756,26 @@ namespace UE::DreamFX::Editor
 					// retry, instead of a rebuild after every bool write.
 					FNiagaraAdapter::EndStructuralEpoch(OwnerAddress.System);
 
+					TArray<TArray<FName>> SkippedInactive;
 					for (const FPlannedInput* Input : Refused)
 					{
-						Errors.Reset();
-						if (!ApplyPlannedInput(ModuleAddress.WithInputPath(Input->Path), *Input, Errors, OutDeferredSelfRefs)
-							&& !ReportInactiveInputRefusal(Errors, Input->Location, Diagnostics))
+						// A chain under an input left out as inactive goes with it.
+						if (IsUnderSkippedInput(Input->Path, SkippedInactive))
 						{
-							ReportAdapterErrors(Errors, TEXT("DFX5021"), Input->Location, Diagnostics);
-							bOk = false;
+							continue;
+						}
+						Errors.Reset();
+						if (!ApplyPlannedInput(ModuleAddress.WithInputPath(Input->Path), *Input, Errors, OutDeferredSelfRefs))
+						{
+							if (ReportInactiveInputRefusal(Errors, Input->Location, Diagnostics))
+							{
+								SkippedInactive.Add(Input->Path);
+							}
+							else
+							{
+								ReportAdapterErrors(Errors, TEXT("DFX5021"), Input->Location, Diagnostics);
+								bOk = false;
+							}
 						}
 					}
 				}

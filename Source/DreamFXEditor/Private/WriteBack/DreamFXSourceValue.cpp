@@ -39,6 +39,14 @@ namespace UE::DreamFX::Editor
 		int32 Dot = INDEX_NONE;
 		if (PackagePath.FindLastChar(TEXT('.'), Dot))
 		{
+			// EndlessAlice local hunk: only `Package.Package` shortens to the package; another object in it -- a
+			// Blueprint's generated class `BP_X.BP_X_C`, a component renderer's ComponentType -- keeps its name.
+			const FString ObjectName = PackagePath.RightChop(Dot + 1);
+			const FString Package = PackagePath.Left(Dot);
+			if (!Package.EndsWith(TEXT("/") + ObjectName))
+			{
+				return PackagePath;
+			}
 			PackagePath.LeftInline(Dot);
 		}
 		return PackagePath;

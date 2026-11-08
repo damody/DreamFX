@@ -18,6 +18,7 @@
 #include "NiagaraScript.h"
 #include "NiagaraSystem.h"
 #include "NiagaraTypes.h"
+#include "NiagaraExternalSystemEditorUtilities.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeExit.h"
 #include "Serialization/JsonReader.h"
@@ -641,6 +642,25 @@ namespace UE::DreamFX::Editor
 				return FString();
 			}
 
+			case EInputValueMode::ObjectAsset:
+				// EndlessAlice local hunk: an `Object<T>` written by a Set Variables entry (`System.NS_Tex = <texture>`).
+				// The same spelling a parameter default uses; an empty slot is `""` so the entry itself survives.
+				return FString::Printf(TEXT("\"%s\""),
+					Value.ObjectAsset != nullptr ? *Value.ObjectAsset->GetPathName() : TEXT(""));
+
+			case EInputValueMode::Unset:
+				// EndlessAlice local hunk: a Set Variables entry for an object or data interface that holds nothing
+				// of its own -- an empty slot, a data interface left at its class defaults.
+				if (Type.IsDataInterface())
+				{
+					return TEXT("\"{}\"");
+				}
+				if (Type.IsUObject())
+				{
+					return TEXT("\"\"");
+				}
+				return TEXT("/* unsupported */");
+
 			default:
 				return TEXT("/* unsupported */");
 			}
@@ -818,6 +838,123 @@ namespace UE::DreamFX::Editor
 		 * `RenderJsonPropertyAsSource`, so that the reader and the writer of a value can never
 		 * disagree about how it is written.
 		 */
+		/**
+		 * EndlessAlice local hunk: an instanced subobject of a renderer (a component renderer's TemplateComponent).
+		 *
+		 * It belongs to the renderer, so it has no path the rebuild could reference; the engine's export names it as
+		 * `Pkg.Sys:Emitter.Renderer_0.ChildActorComponent_0`, which the rebuild rightly refused (DFX5023). Written instead
+		 * as its class and the editable properties it changes from that class's defaults, the generator makes a fresh
+		 * one inside the mirror's renderer (FNiagaraAdapter::SetRendererProperties). A property that itself names a
+		 * subobject is left to the class: it has no spelling either, and is reported as a gap.
+		 */
+		bool TryWriteInstancedSubobject(const UClass* RendererClass, const FString& Key, const TSharedPtr<FJsonValue>& Value,
+			FString& OutSource, TArray<FString>& OutGaps)
+		{
+			const FObjectPropertyBase* Property = FindFProperty<FObjectPropertyBase>(RendererClass, FName(*Key));
+			FString Reference;
+			if (Property == nullptr || !Property->HasAnyPropertyFlags(CPF_InstancedReference)
+				|| Value->Type != EJson::Object || !Value->AsObject().IsValid()
+				|| !Value->AsObject()->TryGetStringField(TEXT("refPath"), Reference) || !Reference.Contains(TEXT(":")))
+			{
+				return false;
+			}
+			UObject* Subobject = StaticFindObject(UObject::StaticClass(), nullptr, *Reference);
+			if (Subobject == nullptr)
+			{
+				return false;
+			}
+
+			TArray<FName> Names;
+			for (TFieldIterator<FProperty> It(Subobject->GetClass()); It; ++It)
+			{
+				if (It->HasAnyPropertyFlags(CPF_Edit) && !It->HasAnyPropertyFlags(CPF_EditConst | CPF_Transient | CPF_Deprecated))
+				{
+					Names.Add(It->GetFName());
+				}
+			}
+			const FNiagaraExternalEditPropertyProvider& Provider = UNiagaraExternalEditUtilities::GetPropertyProvider();
+			TSharedPtr<FJsonObject> Current;
+			TSharedPtr<FJsonObject> Defaults;
+			{
+				const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Provider.GetObjectProperties(Subobject, Names));
+				FJsonSerializer::Deserialize(Reader, Current);
+			}
+			{
+				const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(
+					Provider.GetObjectProperties(Subobject->GetClass()->GetDefaultObject(), Names));
+				FJsonSerializer::Deserialize(Reader, Defaults);
+			}
+			if (!Current.IsValid())
+			{
+				return false;
+			}
+
+			TSharedRef<FJsonObject> Changed = MakeShared<FJsonObject>();
+			TArray<FString> Keys;
+			for (const auto& Pair : Current->Values) { Keys.Add(FString(Pair.Key)); }
+			Keys.Sort();
+			for (const FString& Field : Keys)
+			{
+				const TSharedPtr<FJsonValue> FieldValue = Current->TryGetField(Field);
+				const TSharedPtr<FJsonValue> Default = Defaults.IsValid() ? Defaults->TryGetField(Field) : nullptr;
+				if (!FieldValue.IsValid() || (Default.IsValid() && FJsonValue::CompareEqual(*FieldValue, *Default)))
+				{
+					continue;
+				}
+				TFunction<bool(const TSharedPtr<FJsonValue>&)> NamesSubobject = [&NamesSubobject](const TSharedPtr<FJsonValue>& Node) -> bool
+				{
+					if (!Node.IsValid())
+					{
+						return false;
+					}
+					if (Node->Type == EJson::Array)
+					{
+						for (const TSharedPtr<FJsonValue>& Element : Node->AsArray())
+						{
+							if (NamesSubobject(Element))
+							{
+								return true;
+							}
+						}
+						return false;
+					}
+					if (Node->Type != EJson::Object || !Node->AsObject().IsValid())
+					{
+						return false;
+					}
+					FString Path;
+					if (Node->AsObject()->TryGetStringField(TEXT("refPath"), Path) && Path.Contains(TEXT(":")))
+					{
+						return true;
+					}
+					for (const TPair<FString, TSharedPtr<FJsonValue>>& Member : Node->AsObject()->Values)
+					{
+						if (NamesSubobject(Member.Value))
+						{
+							return true;
+						}
+					}
+					return false;
+				};
+				if (NamesSubobject(FieldValue))
+				{
+					// A reference into the system being read (a nested subobject): no spelling.
+					OutGaps.AddUnique(FString::Printf(TEXT("renderer property '%s.%s' names a subobject; the class default is used"), *Key, *Field));
+					continue;
+				}
+				Changed->SetField(Field, FieldValue);
+			}
+
+			TSharedRef<FJsonObject> Wrapper = MakeShared<FJsonObject>();
+			Wrapper->SetStringField(TEXT("__dreamfxSubobject"), Subobject->GetClass()->GetPathName());
+			Wrapper->SetObjectField(TEXT("Properties"), Changed);
+			FString Json;
+			const TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+				TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Json);
+			FJsonSerializer::Serialize(Wrapper, Writer);
+			return JsonTextToSourceString(Json, OutSource);
+		}
+
 		void WriteChangedRendererProperties(const UClass* RendererClass, const FString& Json,
 			const FString& DefaultsJson, TArray<FString>& OutLines, TArray<FString>& OutGaps)
 		{
@@ -885,6 +1022,13 @@ namespace UE::DreamFX::Editor
 				// One implementation of "what is this value in source", shared with the write-back
 				// direction: a reader and a writer that spell a value differently turn every pull into
 				// a rewrite of the same line.
+				FString Subobject;
+				if (TryWriteInstancedSubobject(RendererClass, Key, Value, Subobject, OutGaps))
+				{
+					OutLines.Add(FString::Printf(TEXT("%s = %s;"), *Key, *Subobject));
+					continue;
+				}
+
 				FString Source;
 				FString Why;
 				if (!RenderJsonPropertyAsSource(RendererClass, Key, Value, Source, Why))
@@ -1562,8 +1706,23 @@ namespace UE::DreamFX::Editor
 					}
 
 					const bool bIsSwitch = InputInfo != nullptr && InputInfo->bStaticSwitch;
+					// EndlessAlice local hunk: `Scale RGB` (a value) and `ScaleRGB` (the toggle gating it) are one
+					// identifier once spaces go; a link value lowers into either, so the rebuild set the toggle
+					// twice (DFX4010). When another input of this module shares the identifier, write the exact
+					// name, which the rebuild matches first.
+					FString Identifier = ToInputIdentifier(Entry.Get<0>());
+					for (const FInputInfo& Other : Module.Inputs)
+					{
+						if (Other.Name != Entry.Get<0>() && ToInputIdentifier(Other.Name) == Identifier)
+						{
+							FString Exact = Entry.Get<0>().ToString();
+							Exact.RemoveFromStart(TEXT("Module."), ESearchCase::IgnoreCase);
+							Identifier = ToNameToken(Exact);
+							break;
+						}
+					}
 					(bIsSwitch ? SwitchArguments : Arguments).Add(FString::Printf(TEXT("%s = %s"),
-						*ToInputIdentifier(Entry.Get<0>()), *InputSource));
+						*Identifier, *InputSource));
 				}
 
 				Arguments.Insert(SwitchArguments, 0);
@@ -1623,8 +1782,30 @@ namespace UE::DreamFX::Editor
 				// carries its editing history (a 003 whose siblings are long deleted), and a link
 				// resolving against a renumbered node dangles as "read before set".
 				FString InstanceSuffix;
+				// EndlessAlice local hunk: a scratch pad module is written as the asset it was materialized into
+				// (`NS_Portal_NM_AnimateEmitterRail`), which is the name the rebuild's node takes; compare with that.
+				FString WrittenAssetName = ModuleSourceName;
+				{
+					int32 At = INDEX_NONE;
+					if (WrittenAssetName.FindChar(TEXT('@'), At))
+					{
+						WrittenAssetName.LeftInline(At);
+					}
+					int32 Slash = INDEX_NONE;
+					if (WrittenAssetName.FindLastChar(TEXT('/'), Slash))
+					{
+						WrittenAssetName.RightChopInline(Slash + 1);
+					}
+					int32 Dot = INDEX_NONE;
+					if (WrittenAssetName.FindChar(TEXT('.'), Dot))
+					{
+						WrittenAssetName.LeftInline(Dot);
+					}
+				}
+				const bool bWrittenUnderOtherName = ModuleSourceName.Contains(TEXT("/"))
+					&& FName(*WrittenAssetName) != Module.ModuleName;
 				if (Module.Script != nullptr
-					&& Module.ModuleName != Module.Script->GetFName())
+					&& (Module.ModuleName != Module.Script->GetFName() || bWrittenUnderOtherName))
 				{
 					InstanceSuffix = FString::Printf(TEXT(" as %s"),
 						*ToNameToken(Module.ModuleName.ToString()));
@@ -2203,7 +2384,10 @@ namespace UE::DreamFX::Editor
 			UNiagaraEmitter* Parent = LoadObject<UNiagaraEmitter>(nullptr, *ParentPath);
 			if (Parent == nullptr || !Parent->IsAsset() || !Parent->bIsInheritable)
 			{
-				NoteInheritanceLimit(Info.Name, TEXT("the parent is not an inheritable standalone emitter asset; this source cannot rebuild until the parent is repaired"), Result, Diagnostics);
+				// EndlessAlice local hunk: the engine keeps such a child running on its own merged copy, and the
+				// rebuild refuses `inherits` on it (DFX3055). Export the child whole instead, without the link.
+				Out.HeaderSuffix.Reset();
+				NoteInheritanceLimit(Info.Name, TEXT("the parent is not an inheritable standalone emitter asset; exported as a standalone emitter without the parent link"), Result, Diagnostics);
 				return;
 			}
 			const FGuid ComparisonVersion = ParentVersion.IsValid() ? ParentVersion : Parent->GetExposedVersion().VersionGuid;
@@ -2327,6 +2511,36 @@ namespace UE::DreamFX::Editor
 		// The asset outlives every collection the walk triggers. Nothing else holds it: an asset the
 		// commandlet loaded and is now reading is reachable from nowhere GC can see.
 		FGCObjectScopeGuard SystemGuard(System);
+
+		// EndlessAlice local hunk: emitter handle names are the keys of the source and of every adapter address,
+		// but older assets can hold two handles of the same name (Realistic Starter's NS_Fire_Small_3 has two
+		// `smoke`). Reading by name would read the first twice; give the later ones the unique name the editor
+		// gives on any rename. Only the loaded copy changes -- nothing here saves the package.
+		{
+			// Compared the way FNiagaraUtilities::GetUniqueName compares, ignoring the FName number: to the
+			// editor `smoke_1` and `smoke` are the same name, and the rebuild could not add both.
+			TSet<FName> Seen;
+			TSet<FName> Taken;
+			for (const FNiagaraEmitterHandle& Handle : System->GetEmitterHandles())
+			{
+				Taken.Add(Handle.GetName());
+			}
+			for (FNiagaraEmitterHandle& Handle : System->GetEmitterHandles())
+			{
+				if (Seen.Contains(FName(Handle.GetName(), 0)))
+				{
+					const FName Old = Handle.GetName();
+					const FName Unique = FNiagaraUtilities::GetUniqueName(Old, Taken);
+					Taken.Add(Unique);
+					Handle.SetName(Unique, *System);
+					UE_LOG(LogDreamFX, Warning, TEXT("Emitter handle '%s' appears more than once in %s; read as '%s'."),
+						*Old.ToString(), *System->GetPathName(), *Handle.GetName().ToString());
+					Result.UnsupportedFeatures.AddUnique(FString::Printf(TEXT("duplicate emitter name '%s' renamed to '%s'"),
+						*Old.ToString(), *Handle.GetName().ToString()));
+				}
+				Seen.Add(FName(Handle.GetName(), 0));
+			}
+		}
 
 		// One edit context for the whole read instead of one per adapter call. Sound here because
 		// nothing below mutates this system -- the schema probe mutates a different one.
