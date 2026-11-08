@@ -22,7 +22,10 @@
 
 #include "Dom/JsonObject.h"
 #include "JsonObjectConverter.h"
+#include "AssetRegistry/IAssetRegistry.h"
+#include "HAL/FileManager.h"
 #include "Misc/PackageName.h"
+#include "Misc/SecureHash.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeExit.h"
 #include "NiagaraCommon.h"
@@ -50,6 +53,102 @@ namespace UE::DreamFX::Editor
 		 * hand exactly once -- at resolution -- and turning a path back into an asset later would mean
 		 * loading it again to ask a question that was already answerable.
 		 */
+		/**
+		 * EndlessAlice local hunk: a stable stand-in for a script's VM compile id. ComputeVMCompilationId hashes the
+		 * graphs as they sit in memory, and some engine modules come out different in every process (Collision's
+		 * NiagaraDistanceFieldCollisions, CollisionQueryAndResponse and SceneDepthTest graphs), so a fresh build was
+		 * called stale by the next verify (DFX7002). The saved hashes of the asset's package and of every Niagara
+		 * package it depends on change exactly when the files do. Empty when a package is unsaved or unknown to the
+		 * asset registry; the caller then keeps the compile id.
+		 */
+		FString StablePackageClosureKey(const UObject* Asset)
+		{
+			if (Asset == nullptr)
+			{
+				return FString();
+			}
+			IAssetRegistry* Registry = IAssetRegistry::Get();
+			if (Registry == nullptr)
+			{
+				return FString();
+			}
+			TArray<FName> Pending{Asset->GetOutermost()->GetFName()};
+			TSet<FName> Seen(Pending);
+			TArray<FString> Entries;
+			while (!Pending.IsEmpty())
+			{
+				const FName PackageName = Pending.Pop();
+				const UPackage* Loaded = FindPackage(nullptr, *PackageName.ToString());
+				if (Loaded != nullptr && Loaded->IsDirty())
+				{
+					return FString();
+				}
+				// The registry carries no saved hash for most engine content, so hash the file itself, once per process.
+				FString FileName;
+				if (!FPackageName::DoesPackageExist(PackageName.ToString(), &FileName))
+				{
+					return FString();
+				}
+				static TMap<FString, TPair<FDateTime, FString>> FileHashes;
+				const FDateTime Stamp = IFileManager::Get().GetTimeStamp(*FileName);
+				const TPair<FDateTime, FString>* Cached = FileHashes.Find(FileName);
+				if (Cached == nullptr || Cached->Key != Stamp)
+				{
+					const FMD5Hash FileHash = FMD5Hash::HashFile(*FileName);
+					if (!FileHash.IsValid())
+					{
+						return FString();
+					}
+					Cached = &FileHashes.Add(FileName, {Stamp, LexToString(FileHash)});
+				}
+				Entries.Add(PackageName.ToString() + TEXT("=") + Cached->Value);
+
+				// A commandlet's registry has not gathered plugin content; scan the file so its dependencies are known.
+				static TSet<FString> ScannedFiles;
+				if (!ScannedFiles.Contains(FileName))
+				{
+					ScannedFiles.Add(FileName);
+					Registry->ScanFilesSynchronous({FileName});
+				}
+				TArray<FName> Dependencies;
+				Registry->GetDependencies(PackageName, Dependencies, UE::AssetRegistry::EDependencyCategory::Package,
+					UE::AssetRegistry::EDependencyQuery::Hard);
+				for (const FName& Dependency : Dependencies)
+				{
+					if (Seen.Contains(Dependency))
+					{
+						continue;
+					}
+					Seen.Add(Dependency);
+					FString DependencyFile;
+					if (Dependency.ToString().StartsWith(TEXT("/Script/"))
+						|| !FPackageName::DoesPackageExist(Dependency.ToString(), &DependencyFile))
+					{
+						continue;
+					}
+					if (!ScannedFiles.Contains(DependencyFile))
+					{
+						ScannedFiles.Add(DependencyFile);
+						Registry->ScanFilesSynchronous({DependencyFile});
+					}
+					// Only Niagara assets feed a module's compile; a texture a data interface names does not.
+					TArray<FAssetData> Assets;
+					Registry->GetAssetsByPackageName(Dependency, Assets, /*bIncludeOnlyOnDiskAssets*/ true);
+					for (const FAssetData& Found : Assets)
+					{
+						const FString ClassName = Found.AssetClassPath.GetAssetName().ToString();
+						if (ClassName.StartsWith(TEXT("Niagara")))
+						{
+							Pending.Add(Dependency);
+							break;
+						}
+					}
+				}
+			}
+			Entries.Sort();
+			return FString::Join(Entries, TEXT("|"));
+		}
+
 		struct FDependencySet
 		{
 			TArray<FString> Paths;
@@ -67,11 +166,18 @@ namespace UE::DreamFX::Editor
 				const FString Path = Asset->GetPathName();
 				Paths.AddUnique(Path);
 				Versions.Add(Path, FNiagaraAdapter::GetScriptVersion(Asset).ToStampString());
-				FNiagaraVMExecutableDataId CompileId;
-				Asset->ComputeVMCompilationId(CompileId, SelectedVersion);
-				FString CompileKey;
-				CompileId.AppendKeyString(CompileKey);
+				FString CompileKey = StablePackageClosureKey(Asset);
+				if (CompileKey.IsEmpty())
+				{
+					FNiagaraVMExecutableDataId CompileId;
+					Asset->ComputeVMCompilationId(CompileId, SelectedVersion);
+					CompileId.AppendKeyString(CompileKey);
+				}
 				CompileInputs.Add(TEXT("module:") + Path + TEXT("@") + SelectedVersion.ToString(), HashSourceText(CompileKey));
+				if (FParse::Param(FCommandLine::Get(), TEXT("DreamFXDumpHash")))
+				{
+					UE_LOG(LogDreamFX, Display, TEXT("HASHKEY %s = %s"), *Path, *CompileKey);
+				}
 			}
 		};
 
@@ -2346,10 +2452,14 @@ namespace UE::DreamFX::Editor
 						for (const UNiagaraScript* Script : ParentScripts)
 						{
 							if (!Script) { continue; }
-							FNiagaraVMExecutableDataId CompileId;
-							Script->ComputeVMCompilationId(CompileId, Current.Version);
-							FString CompileKey;
-							CompileId.AppendKeyString(CompileKey);
+							// EndlessAlice local hunk: the stable key, as for modules (StablePackageClosureKey).
+							FString CompileKey = StablePackageClosureKey(Script);
+							if (CompileKey.IsEmpty())
+							{
+								FNiagaraVMExecutableDataId CompileId;
+								Script->ComputeVMCompilationId(CompileId, Current.Version);
+								CompileId.AppendKeyString(CompileKey);
+							}
 							SourceDependencies.Add(TEXT("parent-script:") + Script->GetPathName() + TEXT("@")
 								+ Current.Version.ToString(), HashSourceText(CompileKey));
 						}
@@ -2585,6 +2695,19 @@ namespace UE::DreamFX::Editor
 
 			SourceDependencies.Append(OutPlan.Dependencies.CompileInputs);
 			OutPlan.EffectiveSourceHash = FProvenance::HashWithSourceDependencies(Document.SourceHash, SourceDependencies);
+			// EndlessAlice local hunk: -DreamFXDumpHash lists what the provenance hash is made of, so a verify that
+			// keeps calling a fresh build stale (DFX7002) can be diffed against the build that stamped it.
+			if (FParse::Param(FCommandLine::Get(), TEXT("DreamFXDumpHash")))
+			{
+				UE_LOG(LogDreamFX, Display, TEXT("HASHDUMP source %s -> %s"), *Document.SourceHash, *OutPlan.EffectiveSourceHash);
+				TArray<FString> Keys;
+				SourceDependencies.GetKeys(Keys);
+				Keys.Sort();
+				for (const FString& Key : Keys)
+				{
+					UE_LOG(LogDreamFX, Display, TEXT("HASHDUMP %s = %s"), *Key, *SourceDependencies[Key]);
+				}
+			}
 
 			if (OutPlan.Emitters.Num() == 0 && bOk)
 			{
@@ -2816,6 +2939,81 @@ namespace UE::DreamFX::Editor
 					InputAddress, Input.Value.DynamicInputAsset, Input.DynamicInputVersion, OutErrors);
 			}
 			return FNiagaraAdapter::SetInput(InputAddress, Input.Value, OutErrors);
+		}
+
+		/**
+		 * EndlessAlice local hunk: an input Niagara refuses as hidden while its stack is written is not
+		 * necessarily inactive in the original. InitializeParticle (V2) shows its Mesh / Sprite / Ribbon
+		 * sections only once the emitter has a renderer of that kind, and renderers are added after the
+		 * stacks, so a from-scratch build saw MeshUniformScale, SpriteSize, RibbonWidth as hidden and left
+		 * them out. Such writes, with the chain under them, wait here and are tried again once every
+		 * emitter has its renderers; only what is refused then is reported as inactive.
+		 */
+		struct FDeferredInactiveInput
+		{
+			FStackAddress Address;
+			FPlannedInput Input;
+			FString Code;
+		};
+		TArray<FDeferredInactiveInput>* GDeferredInactiveInputs = nullptr;
+
+		/** True when the refused write was queued for the retry after renderers. */
+		bool DeferInactiveInput(const TArray<FString>& Errors, const FStackAddress& Address, const FPlannedInput& Input, const TCHAR* Code)
+		{
+			if (GDeferredInactiveInputs == nullptr || Errors.IsEmpty())
+			{
+				return false;
+			}
+			for (const FString& Error : Errors)
+			{
+				if (!Error.Contains(TEXT("is hidden by static-switch")) && !Error.Contains(TEXT("EditCondition currently evaluates false")))
+				{
+					return false;
+				}
+			}
+			GDeferredInactiveInputs->Add({Address, Input, Code});
+			return true;
+		}
+
+		bool RetryDeferredInactiveInputs(TArray<FDeferredInactiveInput>& Deferred, const FStackAddress& SystemAddress,
+			TArray<FDeferredSelfReference>* OutDeferredSelfRefs, FDiagnosticSink& Diagnostics)
+		{
+			if (Deferred.IsEmpty())
+			{
+				return true;
+			}
+			FNiagaraAdapter::EndStructuralEpoch(SystemAddress.System);
+			bool bOk = true;
+			TArray<FString> Errors;
+			TArray<TPair<FStackAddress, TArray<FName>>> Skipped;
+			for (const FDeferredInactiveInput& Entry : Deferred)
+			{
+				bool bUnderSkipped = false;
+				for (const TPair<FStackAddress, TArray<FName>>& Prefix : Skipped)
+				{
+					bUnderSkipped |= Prefix.Key.EmitterName == Entry.Address.EmitterName && Prefix.Key.ScriptName == Entry.Address.ScriptName
+						&& Prefix.Key.ModuleName == Entry.Address.ModuleName && IsUnderSkippedInput(Entry.Input.Path, TArray<TArray<FName>>{Prefix.Value});
+				}
+				if (bUnderSkipped)
+				{
+					continue;
+				}
+				Errors.Reset();
+				if (!ApplyPlannedInput(Entry.Address.WithInputPath(Entry.Input.Path), Entry.Input, Errors, OutDeferredSelfRefs))
+				{
+					if (ReportInactiveInputRefusal(Errors, Entry.Input.Location, Diagnostics))
+					{
+						Skipped.Add({Entry.Address, Entry.Input.Path});
+					}
+					else
+					{
+						ReportAdapterErrors(Errors, *Entry.Code, Entry.Input.Location, Diagnostics);
+						bOk = false;
+					}
+				}
+			}
+			Deferred.Reset();
+			return bOk;
 		}
 
 		/**
@@ -3135,12 +3333,17 @@ namespace UE::DreamFX::Editor
 					{
 						if (IsUnderSkippedInput(Input->Path, SkippedInactive))
 						{
+							if (GDeferredInactiveInputs != nullptr) { GDeferredInactiveInputs->Add({ModuleAddress, *Input, TEXT("DFX5021")}); }
 							continue;
 						}
 						Errors.Reset();
 						if (!ApplyPlannedInput(ModuleAddress.WithInputPath(Input->Path), *Input, Errors, OutDeferredSelfRefs))
 						{
-							if (ReportInactiveInputRefusal(Errors, Input->Location, Diagnostics))
+							if (DeferInactiveInput(Errors, ModuleAddress, *Input, TEXT("DFX5021")))
+							{
+								SkippedInactive.Add(Input->Path);
+							}
+							else if (ReportInactiveInputRefusal(Errors, Input->Location, Diagnostics))
 							{
 								SkippedInactive.Add(Input->Path);
 							}
@@ -3693,12 +3896,17 @@ namespace UE::DreamFX::Editor
 							{
 								if (IsUnderSkippedInput(Nested->Path, SkippedInactive))
 								{
+									if (GDeferredInactiveInputs != nullptr) { GDeferredInactiveInputs->Add({ModuleAddress, *Nested, TEXT("DFX5025")}); }
 									continue;
 								}
 								Errors.Reset();
 								if (!ApplyPlannedInput(ModuleAddress.WithInputPath(Nested->Path), *Nested, Errors, OutDeferredSelfRefs))
 								{
-									if (ReportInactiveInputRefusal(Errors, Nested->Location, Diagnostics))
+									if (DeferInactiveInput(Errors, ModuleAddress, *Nested, TEXT("DFX5025")))
+									{
+										SkippedInactive.Add(Nested->Path);
+									}
+									else if (ReportInactiveInputRefusal(Errors, Nested->Location, Diagnostics))
 									{
 										SkippedInactive.Add(Nested->Path);
 									}
@@ -3762,12 +3970,17 @@ namespace UE::DreamFX::Editor
 						// A chain under an input left out as inactive goes with it.
 						if (IsUnderSkippedInput(Input->Path, SkippedInactive))
 						{
+							if (GDeferredInactiveInputs != nullptr) { GDeferredInactiveInputs->Add({ModuleAddress, *Input, TEXT("DFX5021")}); }
 							continue;
 						}
 						Errors.Reset();
 						if (!ApplyPlannedInput(ModuleAddress.WithInputPath(Input->Path), *Input, Errors, OutDeferredSelfRefs))
 						{
-							if (ReportInactiveInputRefusal(Errors, Input->Location, Diagnostics))
+							if (DeferInactiveInput(Errors, ModuleAddress, *Input, TEXT("DFX5021")))
+							{
+								SkippedInactive.Add(Input->Path);
+							}
+							else if (ReportInactiveInputRefusal(Errors, Input->Location, Diagnostics))
 							{
 								SkippedInactive.Add(Input->Path);
 							}
@@ -4279,6 +4492,10 @@ namespace UE::DreamFX::Editor
 			}
 
 			TArray<FDeferredSelfReference> DeferredSelfRefs;
+			// EndlessAlice local hunk: inputs refused as hidden wait for the renderers (see FDeferredInactiveInput).
+			TArray<FDeferredInactiveInput> DeferredInactive;
+			GDeferredInactiveInputs = &DeferredInactive;
+			ON_SCOPE_EXIT { GDeferredInactiveInputs = nullptr; };
 
 			for (const FPlannedStack& Stack : Plan.SystemStacks)
 			{
@@ -4787,6 +5004,12 @@ namespace UE::DreamFX::Editor
 					ReportAdapterErrors(Errors, TEXT("DFX5032"), Emitter.Location, Diagnostics);
 					return false;
 				}
+			}
+
+			GDeferredInactiveInputs = nullptr;
+			if (!RetryDeferredInactiveInputs(DeferredInactive, SystemAddress, &DeferredSelfRefs, Diagnostics))
+			{
+				return false;
 			}
 
 			if (!ResolveSelfReferences(DeferredSelfRefs))
