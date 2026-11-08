@@ -4688,7 +4688,7 @@ namespace UE::DreamFX::Editor
 							++Report->StacksRebuilt;
 						}
 					}
-					if (!Emitter.Parent)
+					// EndlessAlice local hunk: a parented emitter's rebuilt stacks drop their constants too.
 					{
 						Errors.Reset();
 						if (!FNiagaraAdapter::CleanUpStaleParameters(EmitterAddress, Errors))
@@ -4708,7 +4708,19 @@ namespace UE::DreamFX::Editor
 					{
 						// The whole-emitter path cleared a parentless emitter in one go above, and a partial
 						// one cleared its rebuilt stacks just before; a parented emitter clears each here.
-						if (Emitter.Parent && bWhole && !ClearStack(EmitterAddress, Stack.ScriptName, Diagnostics, Stack.Location)) { return false; }
+						if (Emitter.Parent && bWhole)
+						{
+							if (!ClearStack(EmitterAddress, Stack.ScriptName, Diagnostics, Stack.Location)) { return false; }
+							// EndlessAlice local hunk: the cleared modules leave their constants behind, and a re-added
+							// module picks up the parent's (AudioSpectrumUpdate came back with the parent's Numberofbands
+							// and Angleoffset). Constants the kept inherited stacks still use are not stale and stay.
+							Errors.Reset();
+							if (!FNiagaraAdapter::CleanUpStaleParameters(EmitterAddress, Errors))
+							{
+								UE_LOG(LogDreamFX, Warning, TEXT("emitter '%s': could not clear stale parameters: %s"),
+									*Emitter.Name.ToString(), *FString::Join(Errors, TEXT(" | ")));
+							}
+						}
 						if (!ApplyStack(EmitterAddress, Stack, Diagnostics, OutModuleLocations, &DeferredSelfRefs,
 							&OutDeclared, &OutNodeNames.Add(Key)))
 						{

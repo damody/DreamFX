@@ -2242,9 +2242,60 @@ namespace UE::DreamFX::Editor
 		FOpTimer OpTimer(TEXT("CleanUpStaleParameters"));
 
 #if !DREAMFX_HAS_NIAGARA_FAST_EDIT
-		// Stock engine: hygiene only. What survives is a rapid-iteration parameter for a module the
-		// rebuilt stack no longer has -- it costs a little memory and shows up in the editor's
-		// parameter list, and it does not change what the system simulates.
+		// EndlessAlice local hunk: not hygiene only. A module added again under a name whose constants are
+		// still in the script takes those values as its own -- a rebuilt stack of an inherited emitter
+		// brought back the parent's AudioSpectrumUpdate Numberofbands and Angleoffset. Drop every
+		// "Constants.<emitter>.<node>.*" whose node is no longer a function call in the emitter's graph.
+		if (EmitterAddress.System == nullptr || EmitterAddress.EmitterName.IsNone())
+		{
+			return true;
+		}
+		UNiagaraGraph* Graph = GraphForAddress(EmitterAddress);
+		if (Graph == nullptr)
+		{
+			return true;
+		}
+		TSet<FString> LiveNodes;
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (const UNiagaraNodeFunctionCall* Call = Cast<UNiagaraNodeFunctionCall>(Node))
+			{
+				LiveNodes.Add(Call->GetFunctionName());
+			}
+		}
+		TArray<UNiagaraScript*> Scripts;
+		for (const FNiagaraEmitterHandle& Handle : EmitterAddress.System->GetEmitterHandles())
+		{
+			if (Handle.GetName() == EmitterAddress.EmitterName && Handle.GetEmitterData() != nullptr)
+			{
+				Handle.GetEmitterData()->GetScripts(Scripts, /*bCompilableOnly=*/false);
+			}
+		}
+		for (UNiagaraScript* Script : Scripts)
+		{
+			if (Script == nullptr)
+			{
+				continue;
+			}
+			TArray<FNiagaraVariableBase> Stale;
+			for (const FNiagaraVariableWithOffset& Constant : Script->RapidIterationParameters.ReadParameterVariables())
+			{
+				TArray<FString> Segments;
+				Constant.GetName().ToString().ParseIntoArray(Segments, TEXT("."));
+				if (Segments.Num() > 3 && Segments[0] == TEXT("Constants") && !LiveNodes.Contains(Segments[2]))
+				{
+					Stale.Add(Constant);
+				}
+			}
+			if (!Stale.IsEmpty())
+			{
+				Script->Modify();
+				for (const FNiagaraVariableBase& Constant : Stale)
+				{
+					Script->RapidIterationParameters.RemoveParameter(Constant);
+				}
+			}
+		}
 		return true;
 #else
 		// Structural: it removes parameters from the scripts the stack view models describe, so a
