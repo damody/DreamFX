@@ -1621,8 +1621,40 @@ namespace UE::DreamFX::Editor
 					{
 						auto LinksIntoWritten = [&Written](const FInputValue& Value)
 						{
-							return Value.Mode == EInputValueMode::Linked
-								&& Written.Contains(Value.LinkedVariable.GetName());
+							if (Value.Mode == EInputValueMode::Linked)
+							{
+								return Written.Contains(Value.LinkedVariable.GetName());
+							}
+							// EndlessAlice local hunk: an `hlsl { }` value reads names in its text, and a folded read
+							// of `Particles.R` saw the previous frame's value (Shoggoth spikes flattened, Driller
+							// sparks all one way). Any whole-word use of a written name counts.
+							if (Value.Mode == EInputValueMode::Hlsl)
+							{
+								auto IsWordChar = [](TCHAR Char) { return FChar::IsAlnum(Char) || Char == TEXT('_'); };
+								for (const FName& Name : Written)
+								{
+									const FString Needle = Name.ToString();
+									int32 From = 0;
+									while (true)
+									{
+										const int32 At = Value.HlslExpression.Find(Needle, ESearchCase::CaseSensitive, ESearchDir::FromStart, From);
+										if (At == INDEX_NONE)
+										{
+											break;
+										}
+										const int32 End = At + Needle.Len();
+										const bool bStartsWord = At == 0
+											|| (!IsWordChar(Value.HlslExpression[At - 1]) && Value.HlslExpression[At - 1] != TEXT('.'));
+										const bool bEndsWord = End >= Value.HlslExpression.Len() || !IsWordChar(Value.HlslExpression[End]);
+										if (bStartsWord && bEndsWord)
+										{
+											return true;
+										}
+										From = At + 1;
+									}
+								}
+							}
+							return false;
 						};
 
 						if (LinksIntoWritten(Candidate.Value))
@@ -1651,6 +1683,11 @@ namespace UE::DreamFX::Editor
 							WrittenSoFar.Add(Existing.Name);
 						}
 						bCanFold = !ReadsAlreadyWritten(Parameter, WrittenSoFar);
+						if (!bCanFold)
+						{
+							UE_LOG(LogDreamFX, Verbose, TEXT("Set Parameters split before '%s': it reads a value the module above writes."),
+								*Parameter.Name.ToString());
+						}
 					}
 
 					if (bCanFold)
