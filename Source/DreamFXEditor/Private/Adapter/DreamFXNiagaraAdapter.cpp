@@ -30,6 +30,8 @@
 #include "NiagaraNodeOutput.h"
 #include "NiagaraRendererProperties.h"
 #include "NiagaraMeshRendererProperties.h"
+#include "NiagaraSpriteRendererProperties.h"
+#include "Engine/Texture2D.h"
 #include "NiagaraScript.h"
 #include "NiagaraScriptSource.h"
 #include "NiagaraScriptVariable.h"
@@ -4077,6 +4079,45 @@ namespace UE::DreamFX::Editor
 			UE_LOG(LogDreamFX, Verbose, TEXT("SetRendererData %s"), *Data.PropertyValues);
 			UNiagaraExternalEditUtilities::SetRendererData(ToReference(RendererAddress), Data, Context);
 			bOk = Drain(Context, OutErrors);
+		}
+		// EndlessAlice local hunk: with bUseMaterialCutoutTexture on, every change re-derives CutoutTexture from the material
+		// (UNiagaraSpriteRendererProperties::UpdateCutoutTexture), but an asset can hold an older texture there -- the one its
+		// cutout geometry was baked from. The source's texture is set back directly and the cutout geometry rebaked from it.
+		if (bOk)
+		{
+			TSharedPtr<FJsonObject> Root;
+			const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(PropertiesJson);
+			FString CutoutPath;
+			UNiagaraSpriteRendererProperties* Sprite = nullptr;
+			if (FJsonSerializer::Deserialize(Reader, Root) && Root.IsValid() && Root->TryGetStringField(TEXT("CutoutTexture"), CutoutPath)
+				&& !CutoutPath.IsEmpty() && RendererAddress.System != nullptr)
+			{
+				for (FNiagaraEmitterHandle& Candidate : RendererAddress.System->GetEmitterHandles())
+				{
+					if (Candidate.GetName() == RendererAddress.EmitterName && Candidate.GetEmitterData() != nullptr)
+					{
+						const TArray<UNiagaraRendererProperties*>& Renderers = Candidate.GetEmitterData()->GetRenderers();
+						Sprite = Renderers.IsValidIndex(RendererAddress.RendererIndex)
+							? Cast<UNiagaraSpriteRendererProperties>(Renderers[RendererAddress.RendererIndex]) : nullptr;
+						break;
+					}
+				}
+			}
+			if (Sprite != nullptr && Sprite->bUseMaterialCutoutTexture)
+			{
+				FString ObjectPath = CutoutPath;
+				if (!ObjectPath.Contains(TEXT(".")))
+				{
+					ObjectPath += TEXT(".") + FPackageName::GetShortName(ObjectPath);
+				}
+				UTexture2D* Texture = LoadObject<UTexture2D>(nullptr, *ObjectPath);
+				if (Texture != nullptr && Sprite->CutoutTexture != Texture)
+				{
+					Sprite->Modify();
+					Sprite->CutoutTexture = Texture;
+					Sprite->CacheDerivedData();
+				}
+			}
 		}
 		if (bOk && SubobjectWrites.Num() > 0)
 		{
