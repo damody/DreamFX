@@ -1384,6 +1384,17 @@ namespace UE::DreamFX::Editor
 			const UNiagaraScript* DynamicInput, FScriptVersion& OutVersion, TArray<FString>& OutErrors);
 
 		/**
+		 * EndlessAlice local hunk: the script version of the one dynamic input call held by the input at InputAddress.
+		 *
+		 * For an emitter that calls the same dynamic input at two versions, where GetDynamicInputScriptVersion has no
+		 * single answer (UltraDynamicSky's weather emitters call NormalizeVector both before and after Safe Normalize was
+		 * added; the rebuild put the newer one, with the switch on, everywhere). Builds its own view model, so it is only
+		 * for that case.
+		 */
+		static bool GetDynamicInputScriptVersionAt(const FStackAddress& InputAddress,
+			const UNiagaraScript* DynamicInput, FScriptVersion& OutVersion, TArray<FString>& OutErrors);
+
+		/**
 		 * The FName spelling of an ENiagaraScriptUsage value, e.g. "ParticleUpdateScript".
 		 * Derived from reflection rather than hardcoded so it stays in lockstep with the API's own
 		 * ScriptUsageFromName lookup.

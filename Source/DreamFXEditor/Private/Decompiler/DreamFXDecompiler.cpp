@@ -390,8 +390,11 @@ namespace UE::DreamFX::Editor
 
 				FScriptVersion LiveVersion;
 				TArray<FString> VersionErrors;
+				// EndlessAlice local hunk: an emitter calling this dynamic input at two versions is answered per call.
 				if (FNiagaraAdapter::GetDynamicInputScriptVersion(EmitterAddress, Value.DynamicInputAsset,
-					LiveVersion, VersionErrors))
+					LiveVersion, VersionErrors)
+					|| (Value.DynamicInputAsset->IsVersioningEnabled()
+						&& FNiagaraAdapter::GetDynamicInputScriptVersionAt(InputAddress, Value.DynamicInputAsset, LiveVersion, VersionErrors)))
 				{
 					const FScriptVersion Exposed = FNiagaraAdapter::GetScriptVersion(Value.DynamicInputAsset);
 					if (LiveVersion.bVersioningEnabled && LiveVersion.Guid.IsValid() && LiveVersion.Guid != Exposed.Guid)

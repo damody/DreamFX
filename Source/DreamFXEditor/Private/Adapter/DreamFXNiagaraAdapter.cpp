@@ -7423,6 +7423,36 @@ namespace UE::DreamFX::Editor
 		return true;
 	}
 
+	bool FNiagaraAdapter::GetDynamicInputScriptVersionAt(const FStackAddress& InputAddress,
+		const UNiagaraScript* DynamicInput, FScriptVersion& OutVersion, TArray<FString>& OutErrors)
+	{
+		if (DynamicInput == nullptr || InputAddress.System == nullptr)
+		{
+			OutErrors.Add(TEXT("Cannot read the version of a null dynamic input."));
+			return false;
+		}
+		TSharedPtr<FNiagaraSystemViewModel> ViewModel = StackLookup::CreateSystemViewModel(*InputAddress.System);
+		UNiagaraStackModuleItem* Module = nullptr;
+		FString Why;
+		const UNiagaraStackFunctionInput* Input = ViewModel.IsValid() ? ResolveStackInput(*ViewModel, InputAddress, Module, Why) : nullptr;
+		const UNiagaraNodeFunctionCall* Call = Input != nullptr ? Input->GetDynamicInputNode() : nullptr;
+		if (Call == nullptr || Call->FunctionScript.Get() != DynamicInput)
+		{
+			OutErrors.Add(FString::Printf(TEXT("No call to '%s' at %s%s%s."), *DynamicInput->GetName(), *DescribeInputAddress(InputAddress),
+				Why.IsEmpty() ? TEXT("") : TEXT(": "), *Why));
+			return false;
+		}
+		const FGuid Selected = Call->SelectedScriptVersion.IsValid() ? Call->SelectedScriptVersion : DynamicInput->GetExposedVersion().VersionGuid;
+		const FVersionedNiagaraScriptData* Data = const_cast<UNiagaraScript*>(DynamicInput)->GetScriptData(Selected);
+		if (Data == nullptr)
+		{
+			OutErrors.Add(FString::Printf(TEXT("'%s' is bound to a script version it no longer offers."), *DynamicInput->GetName()));
+			return false;
+		}
+		OutVersion = ToScriptVersion(Data->Version, /*bVersioningEnabled=*/true);
+		return true;
+	}
+
 	FName FNiagaraAdapter::ScriptNameForStack(EStackKind Kind)
 	{
 		ENiagaraScriptUsage Usage;
