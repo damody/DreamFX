@@ -660,6 +660,49 @@ namespace UE::DreamFX::Editor
 			return Value;
 		}
 
+		/**
+		 * EndlessAlice local hunk: the blob without the properties the importer may not set.
+		 *
+		 * The engine's importer (UToolsetLibrary::SetObjectProperties) asks PropertyAccessUtil::CanSetPropertyValue with the
+		 * editor's read-only flags, and one refused key fails the whole object. A data interface's VisibleAnywhere
+		 * properties (FMOD's ParameterNames and bOnlyActiveDuringGameplay) are in a decompiled blob because they are
+		 * properties, and nobody can set them -- the class derives or fixes them -- so leaving them out loses nothing.
+		 */
+		FString StripReadOnlyProperties(UClass* Class, const FString& PropertiesJson)
+		{
+			if (Class == nullptr || PropertiesJson.IsEmpty())
+			{
+				return PropertiesJson;
+			}
+			TSharedPtr<FJsonObject> Parsed;
+			const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(PropertiesJson);
+			if (!FJsonSerializer::Deserialize(Reader, Parsed) || !Parsed.IsValid())
+			{
+				return PropertiesJson;
+			}
+			TArray<FString> Remove;
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : Parsed->Values)
+			{
+				const FProperty* Property = Class->FindPropertyByName(FName(*Field.Key));
+				if (Property != nullptr && (!Property->HasAnyPropertyFlags(CPF_Edit) || Property->HasAnyPropertyFlags(CPF_EditConst)))
+				{
+					Remove.Add(Field.Key);
+				}
+			}
+			if (Remove.IsEmpty())
+			{
+				return PropertiesJson;
+			}
+			for (const FString& Key : Remove)
+			{
+				Parsed->RemoveField(Key);
+			}
+			FString Out;
+			const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Out);
+			FJsonSerializer::Serialize(Parsed.ToSharedRef(), Writer);
+			return Out;
+		}
+
 		/** The blob as the engine's importer can read it. Returns the input unchanged if it will not parse. */
 		FString NormalizeObjectReferences(const FString& PropertiesJson)
 		{
@@ -998,7 +1041,7 @@ namespace UE::DreamFX::Editor
 			case EInputValueMode::DataInterface:
 			{
 				FNiagaraExt_StackInputData_DataInterface& Data = OutValue.InitializeAs<FNiagaraExt_StackInputData_DataInterface>();
-				Data.PropertyValues = NormalizeObjectReferences(Value.DataInterfaceJson);
+				Data.PropertyValues = NormalizeObjectReferences(StripReadOnlyProperties(Value.DataInterfaceClass, Value.DataInterfaceJson));
 				return true;
 			}
 
@@ -2579,7 +2622,7 @@ namespace UE::DreamFX::Editor
 		// importer for one that rejects the `{"refPath": ...}` spelling the exporter still emits, and
 		// one bad reference fails the whole blob rather than the one property.
 		if (!UNiagaraExternalEditUtilities::GetPropertyProvider().SetObjectProperties(
-			Instance, NormalizeObjectReferences(PropertiesJson)))
+			Instance, NormalizeObjectReferences(StripReadOnlyProperties(Instance->GetClass(), PropertiesJson))))
 		{
 			OutErrors.Add(FString::Printf(
 				TEXT("Failed to apply the declared configuration to user data interface '%s' (%s)."),

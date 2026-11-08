@@ -942,6 +942,14 @@ namespace UE::DreamFX::Editor
 
 				const FString Path = Json.Mid(Open, Close - Open);
 				int32 Colon = INDEX_NONE;
+				// EndlessAlice local hunk: a `dfxself://` token names a subobject of the system being built (an emitter
+				// or a renderer of its own); it is parked and resolved against the mirror once every renderer exists
+				// (FDeferredSelfReference), so it is no foreign reference -- its "://" is not a subobject's ':'.
+				if (Path.StartsWith(TEXT("dfxself://"), ESearchCase::CaseSensitive))
+				{
+					Cursor = Close + 1;
+					continue;
+				}
 				if (Path.FindChar(TEXT(':'), Colon))
 				{
 					const FString Package = Path.Left(Path.Find(TEXT("."), ESearchCase::CaseSensitive) == INDEX_NONE
@@ -1027,6 +1035,17 @@ namespace UE::DreamFX::Editor
 				SourceType = Context.DeclaredAttributes->Find(SourceName);
 			}
 			if (SourceType == nullptr || *SourceType == TargetType)
+			{
+				return true;
+			}
+
+			// EndlessAlice local hunk: a Position linked to a Vector3f input (or the other way) is the one pair Niagara
+			// converts on the link itself -- the large world coordinate rebase it inserts -- and original assets lean on it
+			// (`Subtract_Vector(A = Particles.Position, ...)`). Every other mismatch stays the error below.
+			const bool bPositionVectorPair =
+				(*SourceType == FNiagaraTypeDefinition::GetPositionDef() && TargetType == FNiagaraTypeDefinition::GetVec3Def())
+				|| (*SourceType == FNiagaraTypeDefinition::GetVec3Def() && TargetType == FNiagaraTypeDefinition::GetPositionDef());
+			if (bPositionVectorPair)
 			{
 				return true;
 			}
