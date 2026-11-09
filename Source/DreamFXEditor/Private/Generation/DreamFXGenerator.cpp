@@ -4477,6 +4477,44 @@ namespace UE::DreamFX::Editor
 				}
 			}
 
+			// EndlessAlice local hunk: an emitter that still links a parent but is now declared without
+			// `inherits` cannot be reused. Detaching it (ResetEmitterFromParent with no parent) and clearing
+			// it compiled clean, yet the rebuilt NS_Item121_Hit spawned nothing while the same text built
+			// into a new asset spawned like the original. In a full rebuild every emitter is then removed
+			// and added back in source order, exactly as a first build makes them; their GUIDs change.
+			if (bFull)
+			{
+				bool bRecreate = false;
+				for (FName Existing : ExistingEmitters)
+				{
+					const FPlannedEmitter* Planned = Plan.Emitters.FindByPredicate(
+						[Existing](const FPlannedEmitter& Candidate) { return Candidate.Name == Existing; });
+					if (Planned == nullptr || Planned->Parent) { continue; }
+					FString OldParent;
+					FGuid OldVersion;
+					Errors.Reset();
+					if (FNiagaraAdapter::GetEmitterParent(SystemAddress.WithEmitter(Existing), OldParent, OldVersion, Errors)
+						&& !OldParent.IsEmpty())
+					{
+						bRecreate = true;
+						break;
+					}
+				}
+				if (bRecreate)
+				{
+					for (FName Existing : ExistingEmitters)
+					{
+						Errors.Reset();
+						if (!FNiagaraAdapter::RemoveEmitter(SystemAddress.WithEmitter(Existing), Errors))
+						{
+							ReportAdapterErrors(Errors, TEXT("DFX5014"), FSourceLocation(), Diagnostics);
+							return false;
+						}
+					}
+					ExistingEmitters.Reset();
+				}
+			}
+
 			// Emitters that survive are cleared, not removed and re-added: reusing the handle preserves
 			// its GUID, which is what keeps cook diffs and external references stable (plan 4.5).
 			for (FName Existing : ExistingEmitters)
