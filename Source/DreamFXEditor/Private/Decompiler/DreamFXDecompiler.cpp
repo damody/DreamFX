@@ -10,6 +10,7 @@
 #include "AssetRegistry/IAssetRegistry.h"
 #include "Dom/JsonObject.h"
 #include "Misc/PackageName.h"
+#include "HAL/IConsoleManager.h"
 #include "HAL/PlatformMemory.h"
 #include "JsonObjectConverter.h"
 #include "NiagaraCommon.h"
@@ -1857,6 +1858,11 @@ namespace UE::DreamFX::Editor
 			bool bReady = false;
 		};
 
+		// EndlessAlice local hunk: see PrepareInheritedEmitterExport.
+		TAutoConsoleVariable<bool> CVarDreamFXExportInheritedStandalone(
+			TEXT("DreamFX.ExportInheritedStandalone"), true,
+			TEXT("Export an emitter that inherits a parent emitter as a standalone emitter (its merged copy, in full) instead of `inherits` with overrides."));
+
 		void NoteInheritanceLimit(FName EmitterName, const FString& Detail,
 			FDecompileResult& Result, FDiagnosticSink& Diagnostics)
 		{
@@ -2365,6 +2371,16 @@ namespace UE::DreamFX::Editor
 			}
 			if (ParentPath.IsEmpty())
 			{
+				return;
+			}
+			// EndlessAlice local hunk: export every inherited emitter whole, without the parent link. A child
+			// rebuilt on its parent with its stacks as whole-stack overrides compiled clean and matched the
+			// export, yet in 102 of 230 checked systems some or all of its emitters spawned nothing (NS_Item121_Hit:
+			// none of its four emitters; the same text without `inherits` spawned like the original). The asset
+			// runs on its own merged copy of the parent, so that copy, written out in full, is what reproduces it.
+			if (CVarDreamFXExportInheritedStandalone.GetValueOnAnyThread())
+			{
+				NoteInheritanceLimit(Info.Name, FString::Printf(TEXT("it is exported as a standalone emitter without its parent link to %s"), *ParentPath), Result, Diagnostics);
 				return;
 			}
 			Out.HeaderSuffix = FString::Printf(TEXT(" inherits \"%s\""), *ParentPath);
