@@ -16,6 +16,7 @@
 #include "NiagaraCommon.h"
 #include "NiagaraDataInterfaceCurve.h"
 #include "NiagaraEmitter.h"
+#include "NiagaraEmitterEditorData.h"
 #include "NiagaraScript.h"
 #include "NiagaraSystem.h"
 #include "NiagaraTypes.h"
@@ -2561,6 +2562,31 @@ namespace UE::DreamFX::Editor
 				Seen.Add(FName(Handle.GetName(), 0));
 			}
 		}
+
+		// EndlessAlice local hunk: an emitter saved with the stack's summary view switched on gets a
+		// summary stack root with no script groups, so every stack read failed with "Script
+		// 'EmitterSpawnScript' not found" and the emitter was dropped from the export (DFX8002; 12
+		// systems, e.g. NS_Mob_010_CrystalMan_CrystalShot_Charge lost NE_Smoke, NE_Chunks, NE_Snow).
+		// The flag is editor display state only: switch it off for the read and back on afterwards.
+		// Declared before ReadScope so the restore runs after the read's view model is gone.
+		TArray<TWeakObjectPtr<UNiagaraEmitterEditorData>> SummaryViewEmitters;
+		for (const FNiagaraEmitterHandle& Handle : System->GetEmitterHandles())
+		{
+			const FVersionedNiagaraEmitterData* Data = Handle.GetEmitterData();
+			UNiagaraEmitterEditorData* EditorData = Data != nullptr ? Cast<UNiagaraEmitterEditorData>(Data->GetEditorData()) : nullptr;
+			if (EditorData != nullptr && EditorData->ShouldShowSummaryView())
+			{
+				EditorData->SetShowSummaryView(false);
+				SummaryViewEmitters.Add(EditorData);
+			}
+		}
+		ON_SCOPE_EXIT
+		{
+			for (const TWeakObjectPtr<UNiagaraEmitterEditorData>& EditorData : SummaryViewEmitters)
+			{
+				if (EditorData.IsValid()) { EditorData->SetShowSummaryView(true); }
+			}
+		};
 
 		// One edit context for the whole read instead of one per adapter call. Sound here because
 		// nothing below mutates this system -- the schema probe mutates a different one.
