@@ -134,6 +134,13 @@ namespace UE::DreamFX::Editor
 			{
 				Value = TEXT("<object>");
 			}
+			else if (const FVector* World = Variable.GetType() == FNiagaraTypeDefinition::GetPositionDef()
+				? Store.GetPositionParameterValue(Variable.GetName()) : nullptr)
+			{
+				// EndlessAlice local hunk: a Position's value is its world-space entry; the packed bytes stay
+				// zero until an instance resolves them, so comparing them hid every lost Position value.
+				Value = FString::Printf(TEXT("world(%.9g, %.9g, %.9g)"), World->X, World->Y, World->Z);
+			}
 			else if (Variable.Offset >= 0 && Variable.Offset + Variable.GetSizeInBytes() <= Data.Num())
 			{
 				Value = BytesToHex(Data.GetData() + Variable.Offset, Variable.GetSizeInBytes());

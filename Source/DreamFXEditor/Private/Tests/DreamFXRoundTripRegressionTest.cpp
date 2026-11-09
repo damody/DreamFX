@@ -330,4 +330,67 @@ System(Name="Unused", Root="Game") {
 	return true;
 }
 
+// EndlessAlice local hunk: a Position user parameter (the two ends of a chain or beam effect) keeps its
+// value through build, export and rebuild. The export used to declare it bare, which rebuilt as zero.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FDreamFXPositionUserParameterRoundTripTest,
+	"DreamFX.Regression.PositionUserParameterRoundTrip",
+	EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::EngineFilter)
+
+bool FDreamFXPositionUserParameterRoundTripTest::RunTest(const FString& Parameters)
+{
+	using namespace UE::DreamFX;
+	using namespace UE::DreamFX::Editor;
+	using namespace UE::DreamFX::Editor::RoundTripRegression;
+	const FString Source = TEXT(R"(
+System(Name="Unused", Root="Game") {
+    Properties = {
+        Position BeamStart = (10.0, 20.0, 30.0);
+        Position BeamEnd = (300.0, -40.0, 50.5);
+        Position Unset;
+    }
+    Emitter Motes {
+        ParticleSpawn = {
+            Position Particles.Position = User.BeamEnd;
+        }
+    }
+})");
+	auto CheckValues = [this](UNiagaraSystem* System, const TCHAR* Label)
+	{
+		TArray<FUserVariableInfo> Variables;
+		TArray<FString> Errors;
+		if (!TestTrue(FString::Printf(TEXT("%s: read user variables"), Label), FNiagaraAdapter::GetUserVariables(System, Variables, Errors)))
+		{
+			AddError(FString::Join(Errors, TEXT(" | ")));
+			return;
+		}
+		auto Expect = [&](const TCHAR* Name, const FVector3f& Wanted)
+		{
+			const FUserVariableInfo* Found = Variables.FindByPredicate([Name](const FUserVariableInfo& V)
+			{
+				return V.Name.ToString().Equals(FString(TEXT("User.")) + Name);
+			});
+			if (!TestNotNull(FString::Printf(TEXT("%s: User.%s exists"), Label, Name), Found)) { return; }
+			TestTrue(FString::Printf(TEXT("%s: User.%s is a Position"), Label, Name), Found->Type == FNiagaraTypeDefinition::GetPositionDef());
+			if (!TestEqual(FString::Printf(TEXT("%s: User.%s has a 3-float value"), Label, Name), Found->DefaultValue.LiteralBytes.Num(), 12)) { return; }
+			const FVector3f Value = *reinterpret_cast<const FVector3f*>(Found->DefaultValue.LiteralBytes.GetData());
+			TestTrue(FString::Printf(TEXT("%s: User.%s value"), Label, Name), Value.Equals(Wanted, 1.e-4f));
+		};
+		Expect(TEXT("BeamStart"), FVector3f(10.f, 20.f, 30.f));
+		Expect(TEXT("BeamEnd"), FVector3f(300.f, -40.f, 50.5f));
+		Expect(TEXT("Unset"), FVector3f::ZeroVector);
+	};
+	UNiagaraSystem* Original = Build(*this, Source);
+	if (!TestNotNull(TEXT("original"), Original)) { return false; }
+	FGCObjectScopeGuard OriginalGuard(Original);
+	CheckValues(Original, TEXT("original"));
+	const FDecompileResult Exported = Export(*this, Original);
+	TestTrue(TEXT("BeamStart value survives export"), Exported.Source.Contains(TEXT("Position BeamStart = (10.0, 20.0, 30.0);")));
+	TestTrue(TEXT("BeamEnd value survives export"), Exported.Source.Contains(TEXT("Position BeamEnd = (300.0, -40.0, 50.5);")));
+	UNiagaraSystem* Mirror = Build(*this, Exported.Source);
+	if (!TestNotNull(TEXT("mirror"), Mirror)) { return false; }
+	FGCObjectScopeGuard MirrorGuard(Mirror);
+	CheckValues(Mirror, TEXT("mirror"));
+	return true;
+}
+
 #endif

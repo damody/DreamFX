@@ -2514,6 +2514,16 @@ namespace UE::DreamFX::Editor
 			Info.Type = Variable.Type;
 			Info.Description = Variable.Description.ToString();
 			FromVariableValue(Variable.DefaultValue, Info.DefaultValue);
+			// EndlessAlice local hunk: read a Position from the world-space position table (see AddUserVariable);
+			// the packed bytes the engine reports stay empty or zero until an instance resolves them.
+			if (Info.Type == FNiagaraTypeDefinition::GetPositionDef())
+			{
+				if (const FVector* World = System->GetExposedParameters().GetPositionParameterValue(Info.Name))
+				{
+					const FNiagaraPosition Position(*World);
+					Info.DefaultValue = FInputValue::MakeLiteral(FNiagaraPosition::StaticStruct(), &Position);
+				}
+			}
 			OutVariables.Add(MoveTemp(Info));
 		}
 
@@ -2585,6 +2595,20 @@ namespace UE::DreamFX::Editor
 					ScriptVariable->Metadata.Description = FText::FromString(Description);
 				}
 			}
+			FPropertyChangedEvent PropertyChangedEvent(nullptr, EPropertyChangeType::ValueSet);
+			System->PostEditChangeProperty(PropertyChangedEvent);
+		}
+
+		// EndlessAlice local hunk: a Position parameter (the two ends of a chain or beam effect) keeps its value in
+		// the store's world-space position table, not in the packed bytes the engine's add path writes, so the
+		// value was lost and every Position user parameter rebuilt as (0, 0, 0). Write it through the table.
+		if (Type == FNiagaraTypeDefinition::GetPositionDef() && DefaultValue.Mode == EInputValueMode::Literal
+			&& DefaultValue.LiteralBytes.Num() == static_cast<int32>(sizeof(FNiagaraPosition)))
+		{
+			const FNiagaraPosition Position = *reinterpret_cast<const FNiagaraPosition*>(DefaultValue.LiteralBytes.GetData());
+			const FName Key = Exposed.IndexOf(Prefixed) != INDEX_NONE ? Prefixed.GetName() : Bare.GetName();
+			System->Modify();
+			Exposed.SetPositionParameterValue(FVector(Position), Key, /*bAdd=*/false);
 			FPropertyChangedEvent PropertyChangedEvent(nullptr, EPropertyChangeType::ValueSet);
 			System->PostEditChangeProperty(PropertyChangedEvent);
 		}
