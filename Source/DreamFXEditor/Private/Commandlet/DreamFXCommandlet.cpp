@@ -1,5 +1,7 @@
 #include "DreamFXCommandlet.h"
 
+#include "HAL/IConsoleManager.h"
+
 #include "DreamFXDiagnostics.h"
 #include "DreamFXModule.h"
 #include "DreamFXParser.h"
@@ -1243,6 +1245,19 @@ UDreamFXCommandlet::UDreamFXCommandlet()
 
 int32 UDreamFXCommandlet::Main(const FString& Params)
 {
+	// EndlessAlice local hunk: no Niagara traversal cache for the whole run. Its parsed rapid iteration data -- where
+	// static input values live -- is refreshed only when a script's parameter layout changes, not when a value does, so a
+	// process that keeps writing graphs can be told which inputs exist or are hidden from an older switch state. Batches
+	// hit it at random: EmitterState without the distance-culling inputs its switch reveals (DFX3003), an InitializeParticle
+	// export without its lifetime range, an input refused as hidden. The reads and the schema probe already ran without it.
+	if (IConsoleVariable* TraversalCache = IConsoleManager::Get().FindConsoleVariable(TEXT("fx.Niagara.EnableTraversalCache"), false))
+	{
+		if (TraversalCache->GetInt() != 0)
+		{
+			TraversalCache->SetWithCurrentPriority(0);
+		}
+	}
+
 	// plan-v6 P2. An editor open on this project writes the same packages this run is about to write,
 	// and the loser of that race is whichever one saves second. A warning rather than a refusal: this
 	// cannot tell *which* project the editor has open, and being wrong about that should cost a line
